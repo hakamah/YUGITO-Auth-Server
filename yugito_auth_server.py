@@ -3,6 +3,7 @@
 # Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
 # YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
 # requirements.txt : paho-mqtt>=2.1,<3
+# Test OAuth navigateur : https://<ton-service>.onrender.com/oauth/start
 #
 from __future__ import annotations
 
@@ -325,7 +326,29 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             u=urllib.parse.urlsplit(self.path); q=urllib.parse.parse_qs(u.query)
-            if u.path == "/health": self._json(200,{"ok":True,"service":"YUGITO Auth","time":now()}); return
+            if u.path == "/health":
+                self._json(200,{"ok":True,"service":"YUGITO Auth","time":now()}); return
+
+            # Route de test navigateur :
+            # crée automatiquement un device_code temporaire puis lance le flux Google.
+            # Elle permet de tester OAuth sans avoir encore le launcher PC/mobile branché.
+            if u.path == "/oauth/start":
+                dc = secrets.token_urlsafe(32)
+                conn = db()
+                conn.execute(
+                    "INSERT INTO devices(device_code,platform,created_at,expires_at) VALUES(?,?,?,?)",
+                    (dc, "browser-test", now(), now() + DEVICE_TTL),
+                )
+                conn.commit()
+                conn.close()
+
+                target = PUBLIC_BASE + "/login?device_code=" + urllib.parse.quote(dc)
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                return
+
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
                 conn=db(); row=conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?",(dc,now())).fetchone(); conn.close()
