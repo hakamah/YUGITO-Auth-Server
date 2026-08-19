@@ -1,3 +1,9 @@
+# YUGITO Auth Server - version Render corrigee
+# Start Command Render : python yugito_auth_server.py
+# Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+# YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
+# requirements.txt : paho-mqtt>=2.1,<3
+#
 from __future__ import annotations
 
 import base64
@@ -16,7 +22,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DB_PATH = os.getenv("YUGITO_AUTH_DB", "yugito_auth.sqlite3")
-PUBLIC_BASE = os.getenv("YUGITO_PUBLIC_BASE_URL", "").rstrip("/")
+PUBLIC_BASE = (os.getenv("YUGITO_PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 PORT = int(os.getenv("PORT", "8787"))
@@ -355,9 +361,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    if not PUBLIC_BASE or not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
-        print("ERREUR: configure YUGITO_PUBLIC_BASE_URL, GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET")
+    missing = []
+    if not PUBLIC_BASE:
+        missing.append("YUGITO_PUBLIC_BASE_URL (ou RENDER_EXTERNAL_URL)")
+    if not GOOGLE_CLIENT_ID:
+        missing.append("GOOGLE_CLIENT_ID")
+    if not GOOGLE_CLIENT_SECRET:
+        missing.append("GOOGLE_CLIENT_SECRET")
+    if missing:
+        print("ERREUR: variables d'environnement manquantes : " + ", ".join(missing))
         raise SystemExit(2)
+
     db().close()
     print(f"YUGITO Auth sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
