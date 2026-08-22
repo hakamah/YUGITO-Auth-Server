@@ -26,6 +26,15 @@ IDENTITY_NAMESPACE = "yugito/v40-21/identity"
 IDENTITY_APP_KEY = b"YUGITO-V40-21-IDENTITY-REGISTRY-2026"
 MQTT_HOST = os.getenv("YUGITO_MQTT_HOST", "broker.emqx.io")
 MQTT_PORT = int(os.getenv("YUGITO_MQTT_PORT", "8883"))
+SERVER_PATCH_VERSION = "1.4.9-native-google-1"
+
+
+def server_diag(stage: str, message: str = ""):
+    """Diagnostic serveur sans journaliser token, email ou identifiant Google."""
+    try:
+        print(f"[YUGITO-AUTH] stage={stage} | {message}", flush=True)
+    except Exception:
+        pass
 
 
 def now() -> int:
@@ -169,10 +178,17 @@ def google_exchange(code: str):
 
 
 def verify_google_id_token(id_token: str):
+    """Vérifie un ID token Google reçu directement depuis Android.
+
+    Important: le token lui-même n'est jamais écrit dans les logs.
+    """
     id_token = str(id_token or "").strip()
     if not id_token or len(id_token) > 20000:
         raise RuntimeError("Jeton Google invalide.")
-    with urllib.request.urlopen("https://oauth2.googleapis.com/tokeninfo?id_token=" + urllib.parse.quote(id_token), timeout=15) as r:
+    with urllib.request.urlopen(
+        "https://oauth2.googleapis.com/tokeninfo?id_token=" + urllib.parse.quote(id_token),
+        timeout=15,
+    ) as r:
         claims = json.loads(r.read().decode())
     if claims.get("aud") != GOOGLE_CLIENT_ID:
         raise RuntimeError("Audience Google invalide.")
@@ -265,18 +281,26 @@ class Handler(BaseHTTPRequestHandler):
                 conn = db(); conn.execute("INSERT INTO devices(device_code,platform,created_at,expires_at) VALUES(?,?,?,?)", (code, str(b.get("platform") or "unknown")[:20], now(), now()+DEVICE_TTL)); conn.commit(); conn.close()
                 self._json(200, {"ok": True, "device_code": code, "verification_url": PUBLIC_BASE + "/login?device_code=" + urllib.parse.quote(code), "expires_in": DEVICE_TTL, "interval": 2}); return
             if self.path == "/api/google/native":
+                server_diag("google.native.begin", "POST /api/google/native reçu; token non journalisé")
                 b = self._body()
-                claims = verify_google_id_token(str(b.get("id_token") or ""))
+                try:
+                    claims = verify_google_id_token(str(b.get("id_token") or ""))
+                except Exception as e:
+                    server_diag("google.native.reject", f"{type(e).__name__}: {e}")
+                    self._json(401,{"ok":False,"error":str(e)}); return
                 sub = str(claims.get("sub") or claims.get("user_id") or "")
                 if not sub:
+                    server_diag("google.native.reject", "Identité Google sans sub/user_id")
                     self._json(400,{"ok":False,"error":"Identité Google incomplète."}); return
                 conn=db(); row=conn.execute("SELECT * FROM accounts WHERE google_sub=?",(sub,)).fetchone()
+                created = False
                 if not row:
-                    aid=secrets.token_hex(16); t=now()
+                    aid=secrets.token_hex(16); t=now(); created = True
                     conn.execute("INSERT INTO accounts(account_id,google_sub,email,display_name,picture,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(aid,sub,claims.get("email","") ,claims.get("name","") ,claims.get("picture","") ,t,t)); conn.commit(); row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(aid,)).fetchone()
                 else:
                     conn.execute("UPDATE accounts SET email=?,display_name=?,picture=?,updated_at=? WHERE account_id=?",(claims.get("email",row["email"] or ""),claims.get("name",row["display_name"] or ""),claims.get("picture",row["picture"] or ""),now(),row["account_id"])); conn.commit(); row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(row["account_id"],)).fetchone()
                 session=new_session(conn,row["account_id"]); conn.commit(); conn.close()
+                server_diag("google.native.ok", f"Compte {'créé' if created else 'retrouvé'}; pseudo_present={bool(row['pseudo'])}")
                 self._json(200,{"ok":True,"session_token":session,"account":account_public(row)}); return
             if self.path == "/api/account/claim-pseudo":
                 # Flux officiel : Google d'abord, puis choix du pseudo.
@@ -350,7 +374,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             u=urllib.parse.urlsplit(self.path); q=urllib.parse.parse_qs(u.query)
-            if u.path == "/health": self._json(200,{"ok":True,"service":"YUGITO Auth","time":now()}); return
+            if u.path == "/health": self._json(200,{"ok":True,"service":"YUGITO Auth","time":now(),"server_patch":SERVER_PATCH_VERSION,"native_google":True,"native_google_route":"/api/google/native"}); return
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
                 conn=db(); row=conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?",(dc,now())).fetchone(); conn.close()
@@ -390,6 +414,7 @@ def main():
         print("ERREUR: configure YUGITO_PUBLIC_BASE_URL, GOOGLE_CLIENT_ID et GOOGLE_CLIENT_SECRET")
         raise SystemExit(2)
     db().close()
+    server_diag("server.start", f"patch={SERVER_PATCH_VERSION}; native_google=true; public_base={PUBLIC_BASE}")
     print(f"YUGITO Auth sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
