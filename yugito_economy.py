@@ -19,6 +19,8 @@ except Exception:  # local syntax tests may not have dependency
 PARIS = ZoneInfo('Europe/Paris')
 DATABASE_URL = (os.getenv('YUGITO_DATABASE_URL') or os.getenv('DATABASE_URL') or '').strip()
 ADMIN_TOKEN = (os.getenv('YUGITO_ADMIN_TOKEN') or '').strip()
+DEV_EMAIL = (os.getenv('YUGITO_DEV_EMAIL') or '').strip().casefold()
+DEV_PSEUDO = (os.getenv('YUGITO_DEV_PSEUDO') or '').strip().casefold()
 ROTATION_SECRET = (os.getenv('YUGITO_ROTATION_SECRET') or os.getenv('YUGITO_SESSION_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'YUGITO-ROTATION-DEV').encode('utf-8')
 PERMIT_SECRET = (os.getenv('YUGITO_SESSION_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'YUGITO-PERMIT-DEV').encode('utf-8')
 CATALOG_PATH = os.path.join(os.path.dirname(__file__), 'card_catalog.json')
@@ -60,6 +62,15 @@ BASE_CARD_IDS = tuple(c['id'] for c in CATALOG if abs(c['stars'] - BASE_STARS) <
 
 def available() -> bool:
     return bool(DATABASE_URL and psycopg2 is not None)
+
+
+def dev_account_authorized(account: dict | None) -> bool:
+    """Server-side DEV gate. The clients only receive a boolean and never the secret criteria."""
+    if not account or not DEV_EMAIL or not DEV_PSEUDO:
+        return False
+    email=str(account.get('email') or '').strip().casefold()
+    pseudo=' '.join(str(account.get('pseudo') or '').strip().split()).casefold()
+    return hmac.compare_digest(email, DEV_EMAIL) and hmac.compare_digest(pseudo, DEV_PSEUDO)
 
 
 def connect():
@@ -147,6 +158,24 @@ def init_schema() -> None:
               created_at BIGINT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS yugito_audit_account_idx ON yugito_audit_logs(account_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS yugito_social_friends(
+              owner_id TEXT NOT NULL,
+              friend_id TEXT NOT NULL,
+              pseudo TEXT NOT NULL DEFAULT '',
+              active BOOLEAN NOT NULL DEFAULT TRUE,
+              created_at BIGINT NOT NULL,
+              updated_at BIGINT NOT NULL,
+              PRIMARY KEY(owner_id, friend_id)
+            );
+            CREATE INDEX IF NOT EXISTS yugito_social_owner_idx ON yugito_social_friends(owner_id, active, updated_at DESC);
+            CREATE TABLE IF NOT EXISTS yugito_account_profile(
+              account_id TEXT PRIMARY KEY,
+              ranked_matches INTEGER NOT NULL DEFAULT 0,
+              wins INTEGER NOT NULL DEFAULT 0,
+              losses INTEGER NOT NULL DEFAULT 0,
+              best_elo INTEGER NOT NULL DEFAULT 100,
+              updated_at BIGINT NOT NULL
+            );
             ''')
             for c in CATALOG:
                 cur.execute('''INSERT INTO yugito_card_catalog(card_id,name,stars,price_yt,purchasable,updated_at)
@@ -297,6 +326,59 @@ def purchase(account_id: str, card_id: str) -> dict:
         return {'ok':True,'purchase':{'card_id':card_id,'price_yt':price},'state':state(account_id,False)}
     except Exception:
         conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_grant_yt(account_id: str, amount: int) -> dict:
+    amount=int(amount or 0)
+    if amount <= 0: raise ValueError('Le montant YT doit être positif.')
+    if amount > 10_000_000: raise ValueError('Maximum 10 000 000 YT par opération DEV.')
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            cur.execute('SELECT yt_balance FROM yugito_players WHERE account_id=%s FOR UPDATE',(account_id,))
+            before=int(cur.fetchone()[0]); after=before+amount; t=now(); ref='dev-yt-'+secrets.token_hex(10)
+            cur.execute('UPDATE yugito_players SET yt_balance=%s,updated_at=%s WHERE account_id=%s',(after,t,account_id))
+            cur.execute('INSERT INTO yugito_yt_transactions(account_id,amount,balance_before,balance_after,kind,ref_id,metadata,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb,%s)',
+                        (account_id,amount,before,after,'dev_grant',ref,json.dumps({'dev':True},ensure_ascii=False),t))
+            audit(cur,account_id,'dev_grant_yt',ref,{'amount':amount,'balance_before':before,'balance_after':after})
+        conn.commit()
+        return {'ok':True,'amount':amount,'yt_balance':after,'state':state(account_id,False)}
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_remove_card(account_id: str, card_id: str) -> dict:
+    card_id=str(card_id or '')
+    c=CATALOG_BY_ID.get(card_id)
+    if not c: raise ValueError('Carte inconnue.')
+    if float(c['stars']) <= BASE_STARS: raise ValueError('Les cartes 3★ restent débloquées de base pour tous les joueurs.')
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            cur.execute('SELECT source,price_paid FROM yugito_owned_cards WHERE account_id=%s AND card_id=%s FOR UPDATE',(account_id,card_id))
+            owned=cur.fetchone()
+            if not owned: raise ValueError("Cette carte n'est pas possédée définitivement.")
+            cur.execute('DELETE FROM yugito_owned_cards WHERE account_id=%s AND card_id=%s',(account_id,card_id))
+            ref='dev-card-'+secrets.token_hex(10)
+            audit(cur,account_id,'dev_remove_card',ref,{'card_id':card_id,'name':c['name'],'previous_source':owned[0],'previous_price_paid':int(owned[1])})
+        conn.commit()
+        return {'ok':True,'card_id':card_id,'state':state(account_id,False)}
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_record_elo(account_id: str, amount: int, before: int, after: int) -> None:
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            audit(cur,account_id,'dev_grant_elo','dev-elo-'+secrets.token_hex(10),{'amount':int(amount),'elo_before':int(before),'elo_after':int(after)})
+        conn.commit()
     finally: conn.close()
 
 
@@ -519,3 +601,79 @@ def admin_authorized(headers) -> bool:
     if not ADMIN_TOKEN: return False
     got=str(headers.get('X-YUGITO-ADMIN-TOKEN') or '')
     return bool(got and hmac.compare_digest(got,ADMIN_TOKEN))
+
+
+# ---------------------------------------------------------------------------
+# YUGITO 1.6.7 — portable account profile + friends by canonical account_id
+# ---------------------------------------------------------------------------
+def social_merge(account_id: str, local_friends: list[dict] | None) -> dict:
+    """Merge-only bootstrap. Existing tombstones are never resurrected by an old device."""
+    owner=str(account_id or '')
+    rows=[]
+    seen=set()
+    for raw in (local_friends or [])[:300]:
+        if not isinstance(raw,dict):
+            continue
+        fid=str(raw.get('account_id') or raw.get('friend_id') or '').strip()
+        pseudo=' '.join(str(raw.get('pseudo') or 'Shinobi').strip().split())[:20]
+        if not fid or fid==owner or fid in seen:
+            continue
+        seen.add(fid); rows.append((fid,pseudo or 'Shinobi'))
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            t=now()
+            for fid,pseudo in rows:
+                cur.execute('SELECT active FROM yugito_social_friends WHERE owner_id=%s AND friend_id=%s',(owner,fid))
+                ex=cur.fetchone()
+                if ex is None:
+                    cur.execute('INSERT INTO yugito_social_friends(owner_id,friend_id,pseudo,active,created_at,updated_at) VALUES(%s,%s,%s,TRUE,%s,%s)',(owner,fid,pseudo,t,t))
+                elif bool(ex[0]):
+                    cur.execute('UPDATE yugito_social_friends SET pseudo=%s,updated_at=%s WHERE owner_id=%s AND friend_id=%s',(pseudo,t,owner,fid))
+            cur.execute('SELECT friend_id,pseudo,updated_at FROM yugito_social_friends WHERE owner_id=%s AND active=TRUE ORDER BY lower(pseudo),friend_id',(owner,))
+            friends=[{'account_id':r[0],'pseudo':r[1],'updated_at':int(r[2])} for r in cur.fetchall()]
+        conn.commit()
+        return {'ok':True,'friends':friends,'social_sync':True}
+    finally:
+        conn.close()
+
+
+def social_set(account_id: str, friend_id: str, pseudo: str='', active: bool=True) -> dict:
+    owner=str(account_id or ''); fid=str(friend_id or '').strip()
+    if not fid or fid==owner:
+        raise ValueError('Ami invalide.')
+    pseudo=' '.join(str(pseudo or 'Shinobi').strip().split())[:20] or 'Shinobi'
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            t=now()
+            cur.execute('INSERT INTO yugito_social_friends(owner_id,friend_id,pseudo,active,created_at,updated_at) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(owner_id,friend_id) DO UPDATE SET pseudo=EXCLUDED.pseudo,active=EXCLUDED.active,updated_at=EXCLUDED.updated_at', (owner,fid,pseudo,bool(active),t,t))
+        conn.commit()
+    finally:
+        conn.close()
+    return social_merge(owner,[])
+
+
+def profile_sync(account_id: str, profile: dict | None, elo: int=100) -> dict:
+    p=dict(profile or {}); aid=str(account_id or '')
+    incoming=(
+        max(0,int(p.get('ranked_matches') or 0)),
+        max(0,int(p.get('wins') or p.get('ranked_wins') or 0)),
+        max(0,int(p.get('losses') or p.get('ranked_losses') or 0)),
+        max(max(0,int(elo or 100)),max(0,int(p.get('best_elo') or elo or 100))),
+    )
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            t=now()
+            cur.execute('INSERT INTO yugito_account_profile(account_id,ranked_matches,wins,losses,best_elo,updated_at) VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(account_id) DO UPDATE SET ranked_matches=GREATEST(yugito_account_profile.ranked_matches,EXCLUDED.ranked_matches), wins=GREATEST(yugito_account_profile.wins,EXCLUDED.wins), losses=GREATEST(yugito_account_profile.losses,EXCLUDED.losses), best_elo=GREATEST(yugito_account_profile.best_elo,EXCLUDED.best_elo), updated_at=EXCLUDED.updated_at', (aid,incoming[0],incoming[1],incoming[2],incoming[3],t))
+            cur.execute('SELECT ranked_matches,wins,losses,best_elo,updated_at FROM yugito_account_profile WHERE account_id=%s',(aid,))
+            r=cur.fetchone()
+        conn.commit()
+        return {'ranked_matches':int(r[0]),'wins':int(r[1]),'losses':int(r[2]),'best_elo':int(r[3]),'updated_at':int(r[4])}
+    finally:
+        conn.close()
+
+
+def profile_state(account_id: str, elo: int=100) -> dict:
+    return profile_sync(account_id,{},elo)
