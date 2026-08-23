@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yugito_economy as economy
+
 DB_PATH = os.getenv("YUGITO_AUTH_DB", "yugito_auth.sqlite3")
 PUBLIC_BASE = (os.getenv("YUGITO_PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -39,7 +41,7 @@ IDENTITY_NAMESPACE = "yugito/v40-21/identity"
 IDENTITY_APP_KEY = b"YUGITO-V40-21-IDENTITY-REGISTRY-2026"
 MQTT_HOST = os.getenv("YUGITO_MQTT_HOST", "broker.emqx.io")
 MQTT_PORT = int(os.getenv("YUGITO_MQTT_PORT", "8883"))
-SERVER_PATCH_VERSION = "1.4.10-native-drive-1"
+SERVER_PATCH_VERSION = "1.5.0-economy-collection-1"
 
 
 def server_diag(stage: str, message: str = ""):
@@ -587,6 +589,62 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/economy/purchase":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                try:
+                    b = self._body()
+                    self._json(200, economy.purchase(str(ctx["account"]["account_id"]), str(b.get("card_id") or ""))); return
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)}); return
+
+            if self.path == "/api/economy/validate-deck":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                b = self._body()
+                result = economy.validate_deck(str(ctx["account"]["account_id"]), list(b.get("card_ids") or []), bool(b.get("require_eight", True)))
+                self._json(200 if result.get("ok") else 400, result); return
+
+            if self.path == "/api/economy/match-permit":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                try:
+                    b = self._body()
+                    self._json(200, economy.issue_permit(str(ctx["account"]["account_id"]), str(b.get("mode") or "classic"))); return
+                except ValueError as exc:
+                    self._json(403, {"ok": False, "error": str(exc)}); return
+
+            if self.path == "/api/economy/verify-permit":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                b = self._body(); payload = economy.verify_permit(str(b.get("permit") or ""))
+                if not payload:
+                    self._json(400, {"ok": False, "error": "Permis multijoueur invalide ou expiré."}); return
+                self._json(200, {"ok": True, "permit": payload}); return
+
+            if self.path == "/api/economy/settle-match":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                try:
+                    self._json(200, economy.settle_match(str(ctx["account"]["account_id"]), self._body())); return
+                except ValueError as exc:
+                    self._json(400, {"ok": False, "error": str(exc)}); return
+
             if self.path == "/api/device/start":
                 b = self._body(); code = secrets.token_urlsafe(32)
                 conn = db(); conn.execute(
@@ -634,6 +692,10 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
                 restored = bool(drive_identity and drive_identity.get("pseudo"))
                 server_diag("google.native.ok", "Compte YUGITO résolu; pseudo=%s; drive_access=%s; drive_restored=%s" % ("oui" if public and public.get("pseudo") else "non", drive_access, restored))
+                try:
+                    economy.record_event(str(public.get("account_id") or ""), "login_google_native", details={"drive_identity_restored": restored})
+                except Exception as exc:
+                    server_diag("economy.audit.login.error", str(exc))
                 self._json(200, {"ok": True, "session_token": session, "account": public, "drive_access": drive_access, "drive_identity_restored": restored}); return
 
             if self.path == "/api/account/claim-pseudo":
@@ -747,7 +809,26 @@ class Handler(BaseHTTPRequestHandler):
         try:
             u = urllib.parse.urlsplit(self.path); q = urllib.parse.parse_qs(u.query)
             if u.path == "/health":
-                self._json(200, {"ok": True, "service": "YUGITO Auth", "version": "1.4.10", "server_patch": SERVER_PATCH_VERSION, "native_google": True, "native_google_route": "/api/google/native", "drive_identity": True, "drive_scope": DRIVE_SCOPE, "stateless_sessions": True, "time": now()}); return
+                payload = {"ok": True, "service": "YUGITO Auth", "version": "1.5.0", "server_patch": SERVER_PATCH_VERSION, "native_google": True, "native_google_route": "/api/google/native", "drive_identity": True, "drive_scope": DRIVE_SCOPE, "stateless_sessions": True, "time": now()}
+                payload.update(economy.health())
+                self._json(200, payload); return
+
+            if u.path == "/api/economy/state":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "economy_available": False, "error": "Économie YUGITO indisponible."}); return
+                self._json(200, economy.state(str(ctx["account"]["account_id"]), True)); return
+
+            if u.path == "/api/admin/account-logs":
+                if not economy.admin_authorized(self.headers):
+                    self._json(403, {"ok": False, "error": "Accès administrateur refusé."}); return
+                aid = str((q.get("account_id") or [""])[0])
+                if not aid:
+                    self._json(400, {"ok": False, "error": "account_id requis."}); return
+                limit = int((q.get("limit") or ["200"])[0] or 200)
+                self._json(200, economy.account_logs(aid, limit)); return
 
             if u.path == "/oauth/start":
                 dc = secrets.token_urlsafe(32); conn = db(); conn.execute("INSERT INTO devices(device_code,platform,created_at,expires_at) VALUES(?,?,?,?)", (dc, "browser-test", now(), now() + DEVICE_TTL)); conn.commit(); conn.close()
@@ -783,6 +864,10 @@ class Handler(BaseHTTPRequestHandler):
                     drive_save_identity(access, dict(row))
                 session = issue_session(conn, row, access, expires)
                 conn.execute("UPDATE devices SET account_id=?,session_token=? WHERE device_code=?", (row["account_id"], session, state)); conn.commit(); conn.close()
+                try:
+                    economy.record_event(str(row["account_id"]), "login_google_browser")
+                except Exception as exc:
+                    server_diag("economy.audit.login.error", str(exc))
                 self._html(200, "<h1>Compte Google lié ✅</h1><p>YUGITO a récupéré ton identité. Tu peux revenir au jeu.</p><script>setTimeout(()=>{try{window.close()}catch(e){}},500)</script>"); return
 
             if u.path == "/api/device/status":
@@ -813,8 +898,13 @@ def main():
     if missing:
         print("ERREUR: variables d'environnement manquantes : " + ", ".join(missing)); raise SystemExit(2)
     db().close()
-    print(f"YUGITO Auth 1.4.10 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
-    server_diag("server.start", f"patch={SERVER_PATCH_VERSION}; native_google=true; drive_identity=true; stateless_sessions=true; public_base={PUBLIC_BASE}")
+    try:
+        economy.init_schema()
+        server_diag("economy.schema", "PostgreSQL prêt" if economy.available() else "non configuré - Solo client restera disponible")
+    except Exception as exc:
+        server_diag("economy.schema.error", str(exc))
+    print(f"YUGITO Auth 1.5.0 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
+    server_diag("server.start", f"patch={SERVER_PATCH_VERSION}; native_google=true; drive_identity=true; stateless_sessions=true; economy={economy.available()}; public_base={PUBLIC_BASE}")
     print("Identite persistante: Google Drive appData + sessions signees")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
