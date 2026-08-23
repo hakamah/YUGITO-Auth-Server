@@ -19,6 +19,8 @@ except Exception:  # local syntax tests may not have dependency
 PARIS = ZoneInfo('Europe/Paris')
 DATABASE_URL = (os.getenv('YUGITO_DATABASE_URL') or os.getenv('DATABASE_URL') or '').strip()
 ADMIN_TOKEN = (os.getenv('YUGITO_ADMIN_TOKEN') or '').strip()
+DEV_EMAIL = (os.getenv('YUGITO_DEV_EMAIL') or '').strip().casefold()
+DEV_PSEUDO = (os.getenv('YUGITO_DEV_PSEUDO') or '').strip().casefold()
 ROTATION_SECRET = (os.getenv('YUGITO_ROTATION_SECRET') or os.getenv('YUGITO_SESSION_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'YUGITO-ROTATION-DEV').encode('utf-8')
 PERMIT_SECRET = (os.getenv('YUGITO_SESSION_SECRET') or os.getenv('GOOGLE_CLIENT_SECRET') or 'YUGITO-PERMIT-DEV').encode('utf-8')
 CATALOG_PATH = os.path.join(os.path.dirname(__file__), 'card_catalog.json')
@@ -60,6 +62,15 @@ BASE_CARD_IDS = tuple(c['id'] for c in CATALOG if abs(c['stars'] - BASE_STARS) <
 
 def available() -> bool:
     return bool(DATABASE_URL and psycopg2 is not None)
+
+
+def dev_account_authorized(account: dict | None) -> bool:
+    """Server-side DEV gate. The clients only receive a boolean and never the secret criteria."""
+    if not account or not DEV_EMAIL or not DEV_PSEUDO:
+        return False
+    email=str(account.get('email') or '').strip().casefold()
+    pseudo=' '.join(str(account.get('pseudo') or '').strip().split()).casefold()
+    return hmac.compare_digest(email, DEV_EMAIL) and hmac.compare_digest(pseudo, DEV_PSEUDO)
 
 
 def connect():
@@ -297,6 +308,59 @@ def purchase(account_id: str, card_id: str) -> dict:
         return {'ok':True,'purchase':{'card_id':card_id,'price_yt':price},'state':state(account_id,False)}
     except Exception:
         conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_grant_yt(account_id: str, amount: int) -> dict:
+    amount=int(amount or 0)
+    if amount <= 0: raise ValueError('Le montant YT doit être positif.')
+    if amount > 10_000_000: raise ValueError('Maximum 10 000 000 YT par opération DEV.')
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            cur.execute('SELECT yt_balance FROM yugito_players WHERE account_id=%s FOR UPDATE',(account_id,))
+            before=int(cur.fetchone()[0]); after=before+amount; t=now(); ref='dev-yt-'+secrets.token_hex(10)
+            cur.execute('UPDATE yugito_players SET yt_balance=%s,updated_at=%s WHERE account_id=%s',(after,t,account_id))
+            cur.execute('INSERT INTO yugito_yt_transactions(account_id,amount,balance_before,balance_after,kind,ref_id,metadata,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s::jsonb,%s)',
+                        (account_id,amount,before,after,'dev_grant',ref,json.dumps({'dev':True},ensure_ascii=False),t))
+            audit(cur,account_id,'dev_grant_yt',ref,{'amount':amount,'balance_before':before,'balance_after':after})
+        conn.commit()
+        return {'ok':True,'amount':amount,'yt_balance':after,'state':state(account_id,False)}
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_remove_card(account_id: str, card_id: str) -> dict:
+    card_id=str(card_id or '')
+    c=CATALOG_BY_ID.get(card_id)
+    if not c: raise ValueError('Carte inconnue.')
+    if float(c['stars']) <= BASE_STARS: raise ValueError('Les cartes 3★ restent débloquées de base pour tous les joueurs.')
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            cur.execute('SELECT source,price_paid FROM yugito_owned_cards WHERE account_id=%s AND card_id=%s FOR UPDATE',(account_id,card_id))
+            owned=cur.fetchone()
+            if not owned: raise ValueError("Cette carte n'est pas possédée définitivement.")
+            cur.execute('DELETE FROM yugito_owned_cards WHERE account_id=%s AND card_id=%s',(account_id,card_id))
+            ref='dev-card-'+secrets.token_hex(10)
+            audit(cur,account_id,'dev_remove_card',ref,{'card_id':card_id,'name':c['name'],'previous_source':owned[0],'previous_price_paid':int(owned[1])})
+        conn.commit()
+        return {'ok':True,'card_id':card_id,'state':state(account_id,False)}
+    except Exception:
+        conn.rollback(); raise
+    finally: conn.close()
+
+
+def dev_record_elo(account_id: str, amount: int, before: int, after: int) -> None:
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            _ensure_player(cur,account_id)
+            audit(cur,account_id,'dev_grant_elo','dev-elo-'+secrets.token_hex(10),{'amount':int(amount),'elo_before':int(before),'elo_after':int(after)})
+        conn.commit()
     finally: conn.close()
 
 

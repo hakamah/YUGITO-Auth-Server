@@ -41,7 +41,7 @@ IDENTITY_NAMESPACE = "yugito/v40-21/identity"
 IDENTITY_APP_KEY = b"YUGITO-V40-21-IDENTITY-REGISTRY-2026"
 MQTT_HOST = os.getenv("YUGITO_MQTT_HOST", "broker.emqx.io")
 MQTT_PORT = int(os.getenv("YUGITO_MQTT_PORT", "8883"))
-SERVER_PATCH_VERSION = "1.5.0-economy-collection-1"
+SERVER_PATCH_VERSION = "1.5.1-dev-account-tools-1"
 
 
 def server_diag(stage: str, message: str = ""):
@@ -62,6 +62,17 @@ def normalize_pseudo(value: str) -> str:
 
 def normalize_email(value: str) -> str:
     return str(value or "").strip().casefold()
+
+
+def dev_account_authorized(account) -> bool:
+    return economy.dev_account_authorized(dict(account or {}))
+
+
+def economy_state_for_ctx(ctx, include_catalog: bool=True) -> dict:
+    st=economy.state(str(ctx["account"]["account_id"]), include_catalog)
+    st["dev_mode_available"]=bool(dev_account_authorized(ctx.get("account")))
+    st["elo"]=int(ctx["account"].get("elo") or 100)
+    return st
 
 
 def validate_pseudo(value: str):
@@ -589,6 +600,60 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path == "/api/dev/grant-yt":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not dev_account_authorized(ctx["account"]):
+                    self._json(403, {"ok": False, "error": "Compte DEV non autorisé."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                try:
+                    b=self._body(); data=economy.dev_grant_yt(str(ctx["account"]["account_id"]), int(b.get("amount") or 0))
+                    data["state"]=economy_state_for_ctx(ctx, False)
+                    self._json(200,data); return
+                except ValueError as exc:
+                    self._json(400,{"ok":False,"error":str(exc)}); return
+
+            if self.path == "/api/dev/grant-elo":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not dev_account_authorized(ctx["account"]):
+                    self._json(403, {"ok": False, "error": "Compte DEV non autorisé."}); return
+                try:
+                    b=self._body(); amount=int(b.get("amount") or 0)
+                    if amount <= 0: raise ValueError("Le montant ELO doit être positif.")
+                    if amount > 1_000_000: raise ValueError("Maximum 1 000 000 ELO par opération DEV.")
+                    aid=str(ctx["account"]["account_id"]); conn=db()
+                    row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(aid,)).fetchone()
+                    before=int(row["elo"] or 100); after=before+amount
+                    conn.execute("UPDATE accounts SET elo=?,updated_at=? WHERE account_id=?",(after,now(),aid)); conn.commit()
+                    row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(aid,)).fetchone()
+                    access=_session_google_access(ctx)
+                    if access: drive_save_identity(access,dict(row))
+                    conn.close(); economy.dev_record_elo(aid,amount,before,after)
+                    ctx2={"account":dict(row)}
+                    st=economy.state(aid,False); st["dev_mode_available"]=True; st["elo"]=after
+                    self._json(200,{"ok":True,"amount":amount,"elo":after,"account":account_public(row),"state":st}); return
+                except ValueError as exc:
+                    self._json(400,{"ok":False,"error":str(exc)}); return
+
+            if self.path == "/api/dev/remove-card":
+                ctx = auth_context(self.headers)
+                if not ctx:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                if not dev_account_authorized(ctx["account"]):
+                    self._json(403, {"ok": False, "error": "Compte DEV non autorisé."}); return
+                if not economy.available():
+                    self._json(503, {"ok": False, "error": "Économie YUGITO indisponible."}); return
+                try:
+                    b=self._body(); data=economy.dev_remove_card(str(ctx["account"]["account_id"]),str(b.get("card_id") or ""))
+                    data["state"]=economy_state_for_ctx(ctx,False)
+                    self._json(200,data); return
+                except ValueError as exc:
+                    self._json(400,{"ok":False,"error":str(exc)}); return
+
             if self.path == "/api/economy/purchase":
                 ctx = auth_context(self.headers)
                 if not ctx:
@@ -809,7 +874,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             u = urllib.parse.urlsplit(self.path); q = urllib.parse.parse_qs(u.query)
             if u.path == "/health":
-                payload = {"ok": True, "service": "YUGITO Auth", "version": "1.5.0", "server_patch": SERVER_PATCH_VERSION, "native_google": True, "native_google_route": "/api/google/native", "drive_identity": True, "drive_scope": DRIVE_SCOPE, "stateless_sessions": True, "time": now()}
+                payload = {"ok": True, "service": "YUGITO Auth", "version": "1.5.1", "server_patch": SERVER_PATCH_VERSION, "native_google": True, "native_google_route": "/api/google/native", "drive_identity": True, "drive_scope": DRIVE_SCOPE, "stateless_sessions": True, "time": now()}
                 payload.update(economy.health())
                 self._json(200, payload); return
 
@@ -819,7 +884,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(401, {"ok": False, "error": "Session invalide."}); return
                 if not economy.available():
                     self._json(503, {"ok": False, "economy_available": False, "error": "Économie YUGITO indisponible."}); return
-                self._json(200, economy.state(str(ctx["account"]["account_id"]), True)); return
+                self._json(200, economy_state_for_ctx(ctx, True)); return
 
             if u.path == "/api/admin/account-logs":
                 if not economy.admin_authorized(self.headers):
@@ -903,7 +968,7 @@ def main():
         server_diag("economy.schema", "PostgreSQL prêt" if economy.available() else "non configuré - Solo client restera disponible")
     except Exception as exc:
         server_diag("economy.schema.error", str(exc))
-    print(f"YUGITO Auth 1.5.0 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
+    print(f"YUGITO Auth 1.5.1 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
     server_diag("server.start", f"patch={SERVER_PATCH_VERSION}; native_google=true; drive_identity=true; stateless_sessions=true; economy={economy.available()}; public_base={PUBLIC_BASE}")
     print("Identite persistante: Google Drive appData + sessions signees")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
