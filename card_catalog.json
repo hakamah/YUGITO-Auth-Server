@@ -15,7 +15,7 @@
     "id": "nagato",
     "name": "Nagato",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "obito",
@@ -27,25 +27,25 @@
     "id": "itachi",
     "name": "Itachi Uchiha",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "jiraiya",
     "name": "Jiraiya",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "killer_bee",
     "name": "Killer Bee",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "gai",
     "name": "Maito Gai",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "minato",
@@ -57,127 +57,127 @@
     "id": "naruto",
     "name": "Naruto Uzumaki",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "sasuke",
     "name": "Sasuke Uchiha",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "a_raikage",
     "name": "A — 4e Raikage",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "danzo",
     "name": "Danzo Shimura",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "gaara",
     "name": "Gaara",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "sarutobi",
     "name": "Hiruzen Sarutobi",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "kakashi",
     "name": "Kakashi Hatake",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "kisame",
     "name": "Kisame Hoshigaki",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "orochimaru",
     "name": "Orochimaru",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "tsunade",
     "name": "Tsunade",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "deidara",
     "name": "Deidara",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "hidan",
     "name": "Hidan",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "kabuto",
     "name": "Kabuto Yakushi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "neji",
     "name": "Neji Hyuga",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "rock_lee",
     "name": "Rock Lee",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "sakura",
     "name": "Sakura Haruno",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "sasori",
     "name": "Sasori",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "shikamaru",
     "name": "Shikamaru Nara",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "temari",
     "name": "Temari",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "choji",
     "name": "Choji Akimichi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "hinata",
     "name": "Hinata Hyuga",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "kankuro",
@@ -213,19 +213,19 @@
     "id": "karin",
     "name": "Karin",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "onoki",
     "name": "Ônoki",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "gengetsu",
     "name": "Gengetsu Hozuki",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "tobirama",
@@ -237,13 +237,13 @@
     "id": "zabuza",
     "name": "Zabuza Momochi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "shisui",
     "name": "Shisui Uchiwa",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "konohamaru",
@@ -255,37 +255,37 @@
     "id": "haku",
     "name": "Haku",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "a3_raikage",
     "name": "A — 3e Raikage",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "chiyo",
     "name": "Chiyo",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "hanzo",
     "name": "Hanzo",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "kakuzu",
     "name": "Kakuzu",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "mei",
     "name": "Mei Terumi",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "ino",
@@ -297,108 +297,108 @@
     "id": "kurenai",
     "name": "Kurenai Yûhi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "sai",
     "name": "Sai",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "ao",
     "name": "Ao",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "torune",
     "name": "Torune Aburame",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "mifune",
     "name": "Mifune",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "asuma",
     "name": "Asuma Sarutobi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "kushina",
     "name": "Kushina Uzumaki",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "rin",
     "name": "Rin Nohara",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "shizune",
     "name": "Shizune",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "kimimaro",
     "name": "Kimimaro",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "chojuro",
     "name": "Chôjûrô",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "konan",
     "name": "Konan",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "jugo",
     "name": "Jûgo",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "kurotsuchi",
     "name": "Kurotsuchi",
     "stars": 4.0,
-    "price_yt": 800
+    "price_yt": 1000
   },
   {
     "id": "mu",
     "name": "Mû",
     "stars": 4.5,
-    "price_yt": 1300
+    "price_yt": 1500
   },
   {
     "id": "omoi",
     "name": "Omoi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "karui",
     "name": "Karui",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   },
   {
     "id": "anko",
     "name": "Anko Mitarashi",
     "stars": 3.5,
-    "price_yt": 300
+    "price_yt": 500
   }
 ]
