@@ -28,11 +28,13 @@ CATALOG_PATH = os.path.join(os.path.dirname(__file__), 'card_catalog.json')
 WEEKLY_COUNTS = {3.5: 8, 4.0: 6, 4.5: 4, 5.0: 4}
 BASE_STARS = 3.0
 WIN_RULES = {
-    'classic': {'base': 60, 'min': 30, 'max': 100},
-    'ranked': {'base': 70, 'min': 40, 'max': 110},
+    'classic': {'base': 30, 'min': 30, 'max': 30},
+    'ranked': {'base': 30, 'min': 30, 'max': 30},
 }
-PER_STAR_YT = 5
-LOSS_NATURAL_YT = 25
+PER_STAR_YT = 0
+LOSS_NATURAL_YT = 10
+ANTI_FARM_WINDOW_SECONDS = 6 * 60 * 60
+ANTI_FARM_MULTIPLIERS = (1.0, 1.0, 1.0, 0.50, 0.25)
 
 
 def now() -> int:
@@ -481,6 +483,25 @@ def _offense(cur, account_id: str):
     return {'applied_level':level,'next_level':level+1,'duration_seconds':duration,'until':penalty_until}
 
 
+def _same_pair_recent_match_count(cur, account_a: str, account_b: str, window_seconds: int = ANTI_FARM_WINDOW_SECONDS) -> int:
+    cutoff = now() - int(window_seconds)
+    cur.execute(
+        """SELECT COUNT(*) FROM yugito_matches
+           WHERE created_at >= %s
+             AND ((player1_id=%s AND player2_id=%s) OR (player1_id=%s AND player2_id=%s))""",
+        (cutoff, account_a, account_b, account_b, account_a),
+    )
+    row = cur.fetchone()
+    return int(row[0] if row else 0)
+
+
+def _anti_farm_multiplier(previous_pair_matches: int) -> float:
+    idx = max(0, int(previous_pair_matches))
+    if idx < len(ANTI_FARM_MULTIPLIERS):
+        return float(ANTI_FARM_MULTIPLIERS[idx])
+    return 0.0
+
+
 def settle_match(caller_id: str, body: dict) -> dict:
     mode=str(body.get('mode') or '').strip().lower()
     if mode not in ('classic','ranked','private','tournament'):
@@ -513,8 +534,6 @@ def settle_match(caller_id: str, body: dict) -> dict:
         raise ValueError('Permis issus de rotations différentes.')
     winner_stars=s1 if winner_id==p1id else s2
     loser_stars=s2 if winner_id==p1id else s1
-    reward_winner=_reward(mode,winner_stars,loser_stars) if mode in WIN_RULES else 0
-    reward_loser=LOSS_NATURAL_YT if reason=='natural' and mode in WIN_RULES else 0
 
     conn=connect()
     try:
@@ -524,10 +543,20 @@ def settle_match(caller_id: str, body: dict) -> dict:
             if prior:
                 conn.rollback()
                 return {'ok':True,'duplicate':True,'match_id':match_id,'reward_winner':int(prior[1]),'reward_loser':int(prior[2]),'state':state(caller_id,False)}
+            # Anti-farm same pair: 1-3 full rewards, 4th 50%, 5th 25%, 6th+ 0%
+            # in a rolling 6-hour window.
+            previous_pair_matches = _same_pair_recent_match_count(cur,p1id,p2id)
+            anti_farm_multiplier = _anti_farm_multiplier(previous_pair_matches)
+            reward_winner_base = _reward(mode,winner_stars,loser_stars) if mode in WIN_RULES else 0
+            reward_loser_base = LOSS_NATURAL_YT if reason=='natural' and mode in WIN_RULES else 0
+            reward_winner = int(round(reward_winner_base * anti_farm_multiplier))
+            reward_loser = int(round(reward_loser_base * anti_farm_multiplier))
+
             # Serialize both player wallets/penalty rows before mutation.
             _ensure_player(cur,p1id); _ensure_player(cur,p2id)
             cur.execute('SELECT account_id FROM yugito_players WHERE account_id IN (%s,%s) FOR UPDATE',(p1id,p2id)); cur.fetchall()
-            meta={'match_id':match_id,'mode':mode,'finish_reason':reason,'winner_stars':winner_stars,'loser_stars':loser_stars}
+            meta={'match_id':match_id,'mode':mode,'finish_reason':reason,'winner_stars':winner_stars,'loser_stars':loser_stars,
+                  'anti_farm_multiplier':anti_farm_multiplier,'pair_matches_in_window_before':previous_pair_matches}
             if reward_winner:
                 _credit(cur,winner_id,reward_winner,'match_win',match_id,meta)
             if reward_loser:
@@ -583,6 +612,32 @@ def account_logs(account_id: str, limit: int=200) -> dict:
         conn.commit()
         return {'ok':True,'account_id':account_id,'player':{'yt_balance':int(p[0]),'penalty_level':int(p[1]),'clean_games':int(p[2]),'penalty_until':int(p[3])},'owned_cards':cards,'transactions':tx,'logs':logs}
     finally: conn.close()
+
+
+def public_weekly_rotation() -> dict:
+    """Public read-only weekly rotation; exposes no account/session data."""
+    conn=connect()
+    try:
+        with conn.cursor() as cur:
+            rot=current_rotation(cur)
+            ids=list(rot.get('card_ids') or [])
+            cards=[]
+            for cid in ids:
+                c=CATALOG_BY_ID.get(str(cid))
+                if c:
+                    cards.append({'id':c['id'],'name':c['name'],'stars':float(c['stars'])})
+            return {
+                'ok':True,
+                'source':'YUGITO-Auth-Server',
+                'week_key':rot['week_key'],
+                'starts_at':rot['starts_at'],
+                'ends_at':rot['ends_at'],
+                'card_ids':ids,
+                'cards':cards,
+                'counts':{'3.5':8,'4.0':6,'4.5':4,'5.0':4},
+            }
+    finally:
+        conn.close()
 
 
 def health() -> dict:
