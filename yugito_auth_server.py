@@ -41,7 +41,7 @@ IDENTITY_NAMESPACE = "yugito/v40-21/identity"
 IDENTITY_APP_KEY = b"YUGITO-V40-21-IDENTITY-REGISTRY-2026"
 MQTT_HOST = os.getenv("YUGITO_MQTT_HOST", "broker.emqx.io")
 MQTT_PORT = int(os.getenv("YUGITO_MQTT_PORT", "8883"))
-SERVER_PATCH_VERSION = "1.5.2-social-profile-sync-1"
+SERVER_PATCH_VERSION = "1.5.2-social-profile-sync-economy-p66"
 
 
 def server_diag(stage: str, message: str = ""):
@@ -896,6 +896,11 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {"ok": True, "service": "YUGITO Auth", "version": "1.5.2", "server_patch": SERVER_PATCH_VERSION, "native_google": True, "native_google_route": "/api/google/native", "drive_identity": True, "drive_scope": DRIVE_SCOPE, "stateless_sessions": True, "time": now()}
                 payload.update(economy.health()); payload.update({"social_sync": bool(economy.available()), "profile_sync": bool(economy.available())})
                 self._json(200, payload); return
+
+            if u.path == "/api/collection/weekly":
+                if not economy.available():
+                    self._json(503, {"ok": False, "economy_available": False, "error": "Économie YUGITO indisponible."}); return
+                self._json(200, economy.public_weekly_rotation()); return
 
             if u.path == "/api/economy/state":
                 ctx = auth_context(self.headers)
