@@ -1,8 +1,8 @@
-# YUGITO Auth Server - version Render corrigee
+# YUGITO Auth Server - 2.0.11 PERSISTENT DATABASE
 # Start Command Render : python yugito_auth_server.py
-# Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+# Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, DATABASE_URL (sur Render)
 # YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
-# requirements.txt : paho-mqtt>=2.1,<3
+# requirements.txt : paho-mqtt>=2.1,<3 ; psycopg[binary]>=3.2,<4
 #
 from __future__ import annotations
 
@@ -23,6 +23,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DB_PATH = os.getenv("YUGITO_AUTH_DB", "yugito_auth.sqlite3")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+DB_BACKEND = "postgres" if DATABASE_URL else "sqlite"
+IS_RENDER = bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL"))
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_READY = False
 PUBLIC_BASE = (os.getenv("YUGITO_PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
@@ -138,76 +143,156 @@ def validate_pseudo(value: str):
     return True, "", p
 
 
-def db():
+class DBConnection:
+    """Petit adaptateur SQLite/PostgreSQL pour garder le reste du serveur simple."""
+    def __init__(self, raw, backend: str):
+        self.raw = raw
+        self.backend = backend
+        self.closed = False
+
+    def execute(self, sql: str, params=()):
+        if self.closed:
+            raise RuntimeError("Connexion base de données fermée.")
+        statement = str(sql)
+        if self.backend == "postgres":
+            if statement.strip().upper() == "BEGIN IMMEDIATE":
+                statement = "BEGIN"
+            statement = statement.replace("?", "%s")
+        return self.raw.execute(statement, params)
+
+    def executescript(self, script: str):
+        # Les DDL du serveur ne contiennent pas de ';' dans des chaînes SQL.
+        for statement in str(script).split(";"):
+            statement = statement.strip()
+            if statement:
+                self.execute(statement)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        if not self.closed:
+            self.raw.close()
+            self.closed = True
+
+
+def _open_raw_db():
+    if DB_BACKEND == "postgres":
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except Exception as exc:
+            raise RuntimeError("psycopg est requis pour DATABASE_URL PostgreSQL.") from exc
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
     c = sqlite3.connect(DB_PATH, timeout=20)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA journal_mode=WAL")
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS accounts(
-      account_id TEXT PRIMARY KEY,
-      google_sub TEXT UNIQUE NOT NULL,
-      email TEXT,
-      display_name TEXT,
-      picture TEXT,
-      pseudo TEXT UNIQUE,
-      pseudo_norm TEXT UNIQUE,
-      elo INTEGER NOT NULL DEFAULT 100,
-      yt_balance INTEGER NOT NULL DEFAULT 0,
-      created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL,
-      legacy_account_id TEXT
-    );
-    CREATE TABLE IF NOT EXISTS sessions(
-      token_hash TEXT PRIMARY KEY,
-      account_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS devices(
-      device_code TEXT PRIMARY KEY,
-      platform TEXT,
-      created_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      account_id TEXT,
-      session_token TEXT,
-      consumed INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS owned_cards(
-      account_id TEXT NOT NULL,
-      card_id TEXT NOT NULL,
-      purchased_at INTEGER NOT NULL,
-      price_yt INTEGER NOT NULL,
-      PRIMARY KEY(account_id, card_id)
-    );
-    CREATE TABLE IF NOT EXISTS solo_permits(
-      permit TEXT PRIMARY KEY,
-      account_id TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      settled_at INTEGER,
-      victory INTEGER,
-      reward INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS economy_ledger(
-      entry_id TEXT PRIMARY KEY,
-      account_id TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      amount INTEGER NOT NULL,
-      created_at INTEGER NOT NULL,
-      metadata_json TEXT NOT NULL DEFAULT '{}'
-    );
-    CREATE INDEX IF NOT EXISTS idx_owned_cards_account ON owned_cards(account_id);
-    CREATE INDEX IF NOT EXISTS idx_solo_permits_account ON solo_permits(account_id);
-    CREATE INDEX IF NOT EXISTS idx_ledger_account ON economy_ledger(account_id, created_at);
-    """)
-    # Migrations compatibles avec une base déjà créée.
-    cols = {r[1] for r in c.execute("PRAGMA table_info(accounts)").fetchall()}
-    if "elo" not in cols:
-        c.execute("ALTER TABLE accounts ADD COLUMN elo INTEGER NOT NULL DEFAULT 100")
-    if "yt_balance" not in cols:
-        c.execute("ALTER TABLE accounts ADD COLUMN yt_balance INTEGER NOT NULL DEFAULT 0")
-    c.commit()
     return c
+
+
+def _ensure_schema(conn: DBConnection):
+    global _SCHEMA_READY
+    if _SCHEMA_READY:
+        return
+    with _SCHEMA_LOCK:
+        if _SCHEMA_READY:
+            return
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS accounts(
+          account_id TEXT PRIMARY KEY,
+          google_sub TEXT UNIQUE NOT NULL,
+          email TEXT,
+          display_name TEXT,
+          picture TEXT,
+          pseudo TEXT UNIQUE,
+          pseudo_norm TEXT UNIQUE,
+          elo INTEGER NOT NULL DEFAULT 100,
+          yt_balance INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          legacy_account_id TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions(
+          token_hash TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS devices(
+          device_code TEXT PRIMARY KEY,
+          platform TEXT,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          account_id TEXT,
+          session_token TEXT,
+          consumed INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS owned_cards(
+          account_id TEXT NOT NULL,
+          card_id TEXT NOT NULL,
+          purchased_at INTEGER NOT NULL,
+          price_yt INTEGER NOT NULL,
+          PRIMARY KEY(account_id, card_id)
+        );
+        CREATE TABLE IF NOT EXISTS solo_permits(
+          permit TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          settled_at INTEGER,
+          victory INTEGER,
+          reward INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS economy_ledger(
+          entry_id TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          amount INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_owned_cards_account ON owned_cards(account_id);
+        CREATE INDEX IF NOT EXISTS idx_solo_permits_account ON solo_permits(account_id);
+        CREATE INDEX IF NOT EXISTS idx_ledger_account ON economy_ledger(account_id, created_at);
+        """)
+        if conn.backend == "postgres":
+            conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 100")
+            conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS yt_balance INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS legacy_account_id TEXT")
+        else:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(accounts)").fetchall()}
+            if "elo" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN elo INTEGER NOT NULL DEFAULT 100")
+            if "yt_balance" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN yt_balance INTEGER NOT NULL DEFAULT 0")
+            if "legacy_account_id" not in cols:
+                conn.execute("ALTER TABLE accounts ADD COLUMN legacy_account_id TEXT")
+        conn.commit()
+        _SCHEMA_READY = True
+
+
+def db():
+    conn = DBConnection(_open_raw_db(), DB_BACKEND)
+    _ensure_schema(conn)
+    return conn
+
+
+def _adopt_account_id(conn: DBConnection, current_id: str, desired_id: str):
+    """Déplace l'identité et toutes ses données vers l'ancien account_id local."""
+    if not desired_id or desired_id == current_id:
+        if desired_id:
+            conn.execute("UPDATE accounts SET legacy_account_id=? WHERE account_id=?", (desired_id, current_id))
+        return current_id
+    conn.execute("UPDATE accounts SET account_id=?,legacy_account_id=? WHERE account_id=?", (desired_id, desired_id, current_id))
+    conn.execute("UPDATE sessions SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    conn.execute("UPDATE devices SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    conn.execute("UPDATE owned_cards SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    conn.execute("UPDATE solo_permits SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    conn.execute("UPDATE economy_ledger SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    return desired_id
 
 
 def json_bytes(obj):
@@ -453,6 +538,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not ok:
                     self._json(400,{"ok":False,"error":msg}); return
                 legacy = b.get("legacy") if isinstance(b.get("legacy"), dict) else None
+                recovery = b.get("recovery") if isinstance(b.get("recovery"), dict) else None
                 conn=db()
                 clash=conn.execute("SELECT * FROM accounts WHERE pseudo_norm=? AND account_id<>?",(normalize_pseudo(pseudo),acc["account_id"])).fetchone()
                 if clash:
@@ -463,7 +549,30 @@ class Handler(BaseHTTPRequestHandler):
                 # saisit exactement SON ancien pseudo, le launcher envoie sa preuve
                 # locale et on adopte l'ancien account_id afin de conserver l'identité.
                 migrated_account_id = None
-                if legacy:
+                recovered_local_identity = False
+
+                # Recovery Godot 2.0.x : l'ancien account_id local peut être repris
+                # uniquement si l'e-mail du profil local correspond EXACTEMENT au
+                # compte Google authentifié. L'e-mail venant de Google est la preuve.
+                if recovery:
+                    rp = str(recovery.get("pseudo") or "").strip()
+                    raid = str(recovery.get("account_id") or "").strip()
+                    remail = str(recovery.get("email") or "").strip().casefold()
+                    google_email = str(acc.get("email") or "").strip().casefold()
+                    valid_aid = 8 <= len(raid) <= 128 and all(ch.isalnum() or ch in "-_" for ch in raid)
+                    if normalize_pseudo(rp) != normalize_pseudo(pseudo) or not valid_aid or not remail or remail != google_email:
+                        conn.close(); self._json(403,{"ok":False,"error":"La récupération locale ne correspond pas au compte Google connecté."}); return
+                    used = conn.execute("SELECT google_sub FROM accounts WHERE account_id=? AND account_id<>?", (raid, acc["account_id"])).fetchone()
+                    if used:
+                        conn.close(); self._json(409,{"ok":False,"error":"Cet ancien compte YUGITO existe déjà sur le serveur."}); return
+                    old_id = acc["account_id"]
+                    aid_recovered = _adopt_account_id(conn, old_id, raid)
+                    if aid_recovered != old_id:
+                        migrated_account_id = aid_recovered
+                    recovered_local_identity = True
+
+                # Ancien flux historique MQTT (preuve secrète) conservé.
+                if legacy and not recovered_local_identity:
                     lp=str(legacy.get("pseudo") or "")
                     laid=str(legacy.get("account_id") or "")
                     ltok=str(legacy.get("token") or "")
@@ -474,22 +583,14 @@ class Handler(BaseHTTPRequestHandler):
                         if used:
                             conn.close(); self._json(409,{"ok":False,"error":"Cet ancien compte YUGITO est déjà lié à un autre compte Google."}); return
                         old_id=acc["account_id"]
-                        # account_id est l'identifiant canonique YUGITO : on reprend
-                        # l'ancien pour préserver amis/ELO/données historiques.
-                        if laid != old_id:
-                            conn.execute("UPDATE accounts SET account_id=?,legacy_account_id=? WHERE account_id=?",(laid,laid,old_id))
-                            conn.execute("UPDATE sessions SET account_id=? WHERE account_id=?",(laid,old_id))
-                            conn.execute("UPDATE devices SET account_id=? WHERE account_id=?",(laid,old_id))
-                            conn.execute("UPDATE owned_cards SET account_id=? WHERE account_id=?",(laid,old_id))
-                            conn.execute("UPDATE solo_permits SET account_id=? WHERE account_id=?",(laid,old_id))
-                            conn.execute("UPDATE economy_ledger SET account_id=? WHERE account_id=?",(laid,old_id))
-                            migrated_account_id=laid
-                        else:
-                            conn.execute("UPDATE accounts SET legacy_account_id=? WHERE account_id=?",(laid,laid))
+                        aid_legacy = _adopt_account_id(conn, old_id, laid)
+                        if aid_legacy != old_id:
+                            migrated_account_id = aid_legacy
+
                 aid=migrated_account_id or acc["account_id"]
                 conn.execute("UPDATE accounts SET pseudo=?,pseudo_norm=?,updated_at=? WHERE account_id=?",(pseudo,normalize_pseudo(pseudo),now(),aid))
                 conn.commit(); row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(aid,)).fetchone(); conn.close()
-                self._json(200,{"ok":True,"account":account_public(row),"migrated_legacy":bool(migrated_account_id)}); return
+                self._json(200,{"ok":True,"account":account_public(row),"migrated_legacy":bool(migrated_account_id),"recovered_local_identity":recovered_local_identity}); return
             if self.path == "/api/account/link-legacy":
                 acc=auth_account(self.headers)
                 if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
@@ -603,7 +704,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             u=urllib.parse.urlsplit(self.path); q=urllib.parse.parse_qs(u.query)
-            if u.path == "/health": self._json(200,{"ok":True,"service":"YUGITO Auth","version":"economy-2.0.10","economy":True,"time":now()}); return
+            if u.path == "/health":
+                try:
+                    hc = db(); hc.execute("SELECT 1").fetchone(); hc.close()
+                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.0.11","economy":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
+                except Exception as exc:
+                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.0.11","economy":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
+                return
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
                 conn=db(); row=conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?",(dc,now())).fetchone(); conn.close()
@@ -656,12 +763,16 @@ def main():
         missing.append("GOOGLE_CLIENT_ID")
     if not GOOGLE_CLIENT_SECRET:
         missing.append("GOOGLE_CLIENT_SECRET")
+    # Sécurité anti-perte : sur Render, on refuse désormais de démarrer sur SQLite.
+    # Ainsi un déploiement mal configuré ne peut plus créer silencieusement une base éphémère.
+    if IS_RENDER and not DATABASE_URL:
+        missing.append("DATABASE_URL (PostgreSQL persistant)")
     if missing:
         print("ERREUR: variables d'environnement manquantes : " + ", ".join(missing))
         raise SystemExit(2)
 
     db().close()
-    print(f"YUGITO Auth sur 0.0.0.0:{PORT} -> {PUBLIC_BASE}")
+    print(f"YUGITO Auth 2.0.11 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE} | DB={DB_BACKEND} | persistent={bool(DATABASE_URL)}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 if __name__ == "__main__":
