@@ -1,4 +1,4 @@
-# YUGITO Auth Server - 2.0.11 PERSISTENT DATABASE
+# YUGITO Auth Server - 2.2.0 PRODUCTION • INSTANCES + ENTRAÎNEMENT + PERFECTION + HDV
 # Start Command Render : python yugito_auth_server.py
 # Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, DATABASE_URL (sur Render)
 # YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
@@ -43,6 +43,9 @@ MQTT_PORT = int(os.getenv("YUGITO_MQTT_PORT", "8883"))
 SOLO_WIN_YT = 10
 SOLO_LOSS_YT = 0
 SOLO_PERMIT_TTL = 4 * 60 * 60
+MARKET_MIN_PRICE = 1
+MARKET_MAX_PRICE = 10_000_000
+MARKET_MAX_ACTIVE_LISTINGS = 30
 WEEKLY_COUNTS = {"3.5": 8, "4.0": 6, "4.5": 4, "5.0": 4}
 ECONOMY_CATALOG = [{'id': 'hashirama', 'name': 'Hashirama Senju', 'stars': 5.0, 'price_yt': 2000, 'purchasable': True},
  {'id': 'madara', 'name': 'Madara Uchiha', 'stars': 5.0, 'price_yt': 2000, 'purchasable': True},
@@ -254,9 +257,40 @@ def _ensure_schema(conn: DBConnection):
           created_at INTEGER NOT NULL,
           metadata_json TEXT NOT NULL DEFAULT '{}'
         );
+        CREATE TABLE IF NOT EXISTS card_instances(
+          instance_id TEXT PRIMARY KEY,
+          owner_id TEXT NOT NULL,
+          card_id TEXT NOT NULL,
+          original_potential INTEGER NOT NULL,
+          current_potential INTEGER NOT NULL,
+          overjet_hp INTEGER NOT NULL DEFAULT 0,
+          overjet_tai INTEGER NOT NULL DEFAULT 0,
+          overjet_nin INTEGER NOT NULL DEFAULT 0,
+          overjet_gen INTEGER NOT NULL DEFAULT 0,
+          acquisition_type TEXT NOT NULL DEFAULT 'SHOP',
+          acquired_at INTEGER NOT NULL,
+          price_paid INTEGER NOT NULL DEFAULT 0,
+          listed INTEGER NOT NULL DEFAULT 0,
+          updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS market_listings(
+          listing_id TEXT PRIMARY KEY,
+          instance_id TEXT NOT NULL UNIQUE,
+          seller_id TEXT NOT NULL,
+          card_id TEXT NOT NULL,
+          price_yt INTEGER NOT NULL,
+          status TEXT NOT NULL DEFAULT 'active',
+          buyer_id TEXT,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL,
+          completed_at INTEGER
+        );
         CREATE INDEX IF NOT EXISTS idx_owned_cards_account ON owned_cards(account_id);
         CREATE INDEX IF NOT EXISTS idx_solo_permits_account ON solo_permits(account_id);
         CREATE INDEX IF NOT EXISTS idx_ledger_account ON economy_ledger(account_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_instances_owner ON card_instances(owner_id, card_id);
+        CREATE INDEX IF NOT EXISTS idx_market_active ON market_listings(status, price_yt, created_at);
+        CREATE INDEX IF NOT EXISTS idx_market_seller ON market_listings(seller_id, status, created_at);
         """)
         if conn.backend == "postgres":
             conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 100")
@@ -270,6 +304,16 @@ def _ensure_schema(conn: DBConnection):
                 conn.execute("ALTER TABLE accounts ADD COLUMN yt_balance INTEGER NOT NULL DEFAULT 0")
             if "legacy_account_id" not in cols:
                 conn.execute("ALTER TABLE accounts ADD COLUMN legacy_account_id TEXT")
+        # Migration sans perte des anciennes possessions modèle -> exemplaires.
+        for legacy in conn.execute("SELECT account_id,card_id,purchased_at,price_yt FROM owned_cards").fetchall():
+            raw = f"{legacy['account_id']}|{legacy['card_id']}".encode("utf-8")
+            iid = "LEGACY-" + hashlib.sha256(raw).hexdigest()[:32]
+            potential = 90 + (int(hashlib.sha256(raw + b'|potential').hexdigest()[:8], 16) % 11)
+            conn.execute("""INSERT INTO card_instances(instance_id,owner_id,card_id,original_potential,current_potential,
+                         acquisition_type,acquired_at,price_paid,listed,updated_at)
+                         SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM card_instances WHERE instance_id=?)""",
+                         (iid, legacy["account_id"], legacy["card_id"], potential, potential, "LEGACY_MIGRATION",
+                          int(legacy["purchased_at"]), int(legacy["price_yt"]), 0, now(), iid))
         conn.commit()
         _SCHEMA_READY = True
 
@@ -290,6 +334,9 @@ def _adopt_account_id(conn: DBConnection, current_id: str, desired_id: str):
     conn.execute("UPDATE sessions SET account_id=? WHERE account_id=?", (desired_id, current_id))
     conn.execute("UPDATE devices SET account_id=? WHERE account_id=?", (desired_id, current_id))
     conn.execute("UPDATE owned_cards SET account_id=? WHERE account_id=?", (desired_id, current_id))
+    conn.execute("UPDATE card_instances SET owner_id=? WHERE owner_id=?", (desired_id, current_id))
+    conn.execute("UPDATE market_listings SET seller_id=? WHERE seller_id=?", (desired_id, current_id))
+    conn.execute("UPDATE market_listings SET buyer_id=? WHERE buyer_id=?", (desired_id, current_id))
     conn.execute("UPDATE solo_permits SET account_id=? WHERE account_id=?", (desired_id, current_id))
     conn.execute("UPDATE economy_ledger SET account_id=? WHERE account_id=?", (desired_id, current_id))
     return desired_id
@@ -385,13 +432,19 @@ def economy_state(conn, account_id: str, include_catalog: bool = True):
     acc = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
     if not acc:
         return None
-    owned = [r["card_id"] for r in conn.execute(
-        "SELECT card_id FROM owned_cards WHERE account_id=? ORDER BY card_id", (account_id,)
-    ).fetchall()]
+    instance_rows = conn.execute("SELECT * FROM card_instances WHERE owner_id=? ORDER BY acquired_at,instance_id", (account_id,)).fetchall()
+    instances = [dict(r) for r in instance_rows]
+    owned = []
+    playable_owned = []
+    for r in instances:
+        if r["card_id"] not in owned:
+            owned.append(r["card_id"])
+        if not int(r.get("listed", 0)) and r["card_id"] not in playable_owned:
+            playable_owned.append(r["card_id"])
     rotation = weekly_rotation_payload()
     free_ids = list(rotation["card_ids"])
     available = []
-    for cid in BASE_CARD_IDS + owned + free_ids:
+    for cid in BASE_CARD_IDS + playable_owned + free_ids:
         if cid not in available:
             available.append(cid)
     data = {
@@ -400,6 +453,8 @@ def economy_state(conn, account_id: str, include_catalog: bool = True):
         "yt_balance": int(acc["yt_balance"]),
         "base_card_ids": list(BASE_CARD_IDS),
         "owned_card_ids": owned,
+        "playable_owned_card_ids": playable_owned,
+        "card_instances": instances,
         "free_card_ids": free_ids,
         "available_card_ids": available,
         "rotation": {
@@ -412,6 +467,44 @@ def economy_state(conn, account_id: str, include_catalog: bool = True):
     if include_catalog:
         data["catalog"] = ECONOMY_CATALOG
     return data
+
+
+def _new_instance(conn, owner_id: str, card_id: str, price_paid: int, acquisition: str = "SHOP"):
+    potential = secrets.randbelow(11) + 90
+    iid = "CARD-" + secrets.token_hex(16)
+    t = now()
+    conn.execute("""INSERT INTO card_instances(instance_id,owner_id,card_id,original_potential,current_potential,
+                 acquisition_type,acquired_at,price_paid,listed,updated_at) VALUES(?,?,?,?,?,?,?,?,0,?)""",
+                 (iid, owner_id, card_id, potential, potential, acquisition, t, price_paid, t))
+    return conn.execute("SELECT * FROM card_instances WHERE instance_id=?", (iid,)).fetchone()
+
+
+def _listing_public(row):
+    bonus_total = (
+        int(row["overjet_hp"]) + int(row["overjet_tai"])
+        + int(row["overjet_nin"]) + int(row["overjet_gen"])
+    )
+    total_percent = int(row["current_potential"]) + bonus_total
+    return {
+        "listing_id": row["listing_id"], "instance_id": row["instance_id"], "card_id": row["card_id"],
+        "price_yt": int(row["price_yt"]), "status": row["status"], "seller_id": row["seller_id"],
+        "seller_pseudo": row["seller_pseudo"] or "Ninja", "buyer_id": row["buyer_id"],
+        "created_at": int(row["created_at"]), "updated_at": int(row["updated_at"]),
+        "completed_at": row["completed_at"], "original_potential": int(row["original_potential"]),
+        "current_potential": int(row["current_potential"]), "overjet_hp": int(row["overjet_hp"]),
+        "overjet_tai": int(row["overjet_tai"]), "overjet_nin": int(row["overjet_nin"]),
+        "overjet_gen": int(row["overjet_gen"]), "bonus_total": bonus_total,
+        "total_percent": total_percent,
+        "is_full": int(row["current_potential"]) >= 100 and bonus_total >= 10,
+    }
+
+
+def market_listings(conn, where="l.status='active'", params=(), order="l.price_yt ASC, l.created_at DESC", limit=100):
+    rows = conn.execute(f"""SELECT l.*,i.original_potential,i.current_potential,i.overjet_hp,i.overjet_tai,
+        i.overjet_nin,i.overjet_gen,a.pseudo AS seller_pseudo FROM market_listings l
+        JOIN card_instances i ON i.instance_id=l.instance_id JOIN accounts a ON a.account_id=l.seller_id
+        WHERE {where} ORDER BY {order} LIMIT ?""", tuple(params) + (limit,)).fetchall()
+    return [_listing_public(r) for r in rows]
 
 
 def _clean_old_solo_permits(conn):
@@ -631,25 +724,202 @@ class Handler(BaseHTTPRequestHandler):
                 conn = db()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                    already = conn.execute("SELECT 1 FROM owned_cards WHERE account_id=? AND card_id=?", (acc["account_id"], cid)).fetchone()
-                    if already:
-                        conn.rollback()
-                        state = economy_state(conn, acc["account_id"], True)
-                        self._json(200, {"ok": True, "already_owned": True, "purchase": {"card_id": cid, "price_yt": 0}, "state": state}); return
                     row = conn.execute("SELECT yt_balance FROM accounts WHERE account_id=?", (acc["account_id"],)).fetchone()
                     balance = int(row["yt_balance"] if row else 0)
                     if balance < price:
                         conn.rollback(); conn.close()
                         self._json(409, {"ok": False, "error": "YT insuffisants.", "yt_balance": balance, "price_yt": price}); return
                     conn.execute("UPDATE accounts SET yt_balance=yt_balance-?,updated_at=? WHERE account_id=?", (price, now(), acc["account_id"]))
-                    conn.execute("INSERT INTO owned_cards(account_id,card_id,purchased_at,price_yt) VALUES(?,?,?,?)", (acc["account_id"], cid, now(), price))
+                    instance = _new_instance(conn, acc["account_id"], cid, price)
                     conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
                                  (secrets.token_hex(16), acc["account_id"], "purchase", -price, now(), json.dumps({"card_id": cid}, separators=(",", ":"))))
                     conn.commit()
                     state = economy_state(conn, acc["account_id"], True)
                 finally:
                     conn.close()
-                self._json(200, {"ok": True, "purchase": {"card_id": cid, "price_yt": price}, "state": state}); return
+                self._json(200, {"ok": True, "purchase": {"card_id": cid, "price_yt": price}, "instance": dict(instance), "state": state}); return
+            if self.path == "/api/market/list":
+                acc = auth_account(self.headers)
+                if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
+                b=self._body(); iid=str(b.get("instance_id") or "").strip()
+                try: price=int(b.get("price_yt") or 0)
+                except Exception: price=0
+                if price < MARKET_MIN_PRICE or price > MARKET_MAX_PRICE:
+                    self._json(400,{"ok":False,"error":f"Prix autorisé : {MARKET_MIN_PRICE} à {MARKET_MAX_PRICE} YT."}); return
+                conn=db()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    count=conn.execute("SELECT COUNT(*) AS n FROM market_listings WHERE seller_id=? AND status='active'",(acc["account_id"],)).fetchone()
+                    if int(count["n"]) >= MARKET_MAX_ACTIVE_LISTINGS:
+                        conn.rollback(); self._json(409,{"ok":False,"error":f"Maximum {MARKET_MAX_ACTIVE_LISTINGS} ventes actives."}); return
+                    inst=conn.execute("SELECT * FROM card_instances WHERE instance_id=? AND owner_id=?",(iid,acc["account_id"])).fetchone()
+                    if not inst or int(inst["listed"]):
+                        conn.rollback(); self._json(409,{"ok":False,"error":"Exemplaire introuvable ou déjà en vente."}); return
+                    lid="SALE-"+secrets.token_hex(16); t=now()
+                    conn.execute("INSERT INTO market_listings(listing_id,instance_id,seller_id,card_id,price_yt,status,created_at,updated_at) VALUES(?,?,?,?,?,'active',?,?)",(lid,iid,acc["account_id"],inst["card_id"],price,t,t))
+                    conn.execute("UPDATE card_instances SET listed=1,updated_at=? WHERE instance_id=?",(t,iid)); conn.commit()
+                    listing=market_listings(conn,"l.listing_id=?",(lid,))[0]
+                finally: conn.close()
+                self._json(200,{"ok":True,"listing":listing}); return
+            if self.path in ("/api/market/cancel", "/api/market/update-price"):
+                acc=auth_account(self.headers)
+                if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
+                b=self._body(); lid=str(b.get("listing_id") or "").strip(); conn=db()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row=conn.execute("SELECT * FROM market_listings WHERE listing_id=? AND seller_id=? AND status='active'",(lid,acc["account_id"])).fetchone()
+                    if not row: conn.rollback(); self._json(404,{"ok":False,"error":"Vente active introuvable."}); return
+                    t=now()
+                    if self.path.endswith("cancel"):
+                        conn.execute("UPDATE market_listings SET status='cancelled',updated_at=?,completed_at=? WHERE listing_id=?",(t,t,lid))
+                        conn.execute("UPDATE card_instances SET listed=0,updated_at=? WHERE instance_id=?",(t,row["instance_id"])); conn.commit()
+                        self._json(200,{"ok":True,"cancelled":True,"listing_id":lid}); return
+                    try: price=int(b.get("price_yt") or 0)
+                    except Exception: price=0
+                    if price < MARKET_MIN_PRICE or price > MARKET_MAX_PRICE:
+                        conn.rollback(); self._json(400,{"ok":False,"error":f"Prix autorisé : {MARKET_MIN_PRICE} à {MARKET_MAX_PRICE} YT."}); return
+                    conn.execute("UPDATE market_listings SET price_yt=?,updated_at=? WHERE listing_id=?",(price,t,lid)); conn.commit()
+                finally: conn.close()
+                self._json(200,{"ok":True,"listing_id":lid,"price_yt":price}); return
+            if self.path == "/api/market/buy":
+                acc=auth_account(self.headers)
+                if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
+                lid=str(self._body().get("listing_id") or "").strip(); conn=db()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    if conn.backend == "postgres":
+                        sale=conn.execute("SELECT * FROM market_listings WHERE listing_id=? FOR UPDATE",(lid,)).fetchone()
+                    else: sale=conn.execute("SELECT * FROM market_listings WHERE listing_id=?",(lid,)).fetchone()
+                    if not sale or sale["status"] != "active": conn.rollback(); self._json(409,{"ok":False,"error":"Cette vente n'est plus disponible."}); return
+                    if sale["seller_id"] == acc["account_id"]: conn.rollback(); self._json(400,{"ok":False,"error":"Tu ne peux pas acheter ta propre vente."}); return
+                    price=int(sale["price_yt"]); buyer=conn.execute("SELECT yt_balance FROM accounts WHERE account_id=?",(acc["account_id"],)).fetchone()
+                    inst=conn.execute("SELECT * FROM card_instances WHERE instance_id=? AND owner_id=? AND listed=1",(sale["instance_id"],sale["seller_id"])).fetchone()
+                    if not inst: conn.rollback(); self._json(409,{"ok":False,"error":"L'exemplaire n'est plus transférable."}); return
+                    if not buyer or int(buyer["yt_balance"]) < price: conn.rollback(); self._json(409,{"ok":False,"error":"YT insuffisants.","price_yt":price}); return
+                    t=now(); seller=sale["seller_id"]
+                    conn.execute("UPDATE accounts SET yt_balance=yt_balance-?,updated_at=? WHERE account_id=?",(price,t,acc["account_id"]))
+                    conn.execute("UPDATE accounts SET yt_balance=yt_balance+?,updated_at=? WHERE account_id=?",(price,t,seller))
+                    conn.execute("UPDATE card_instances SET owner_id=?,listed=0,acquisition_type='MARKET',acquired_at=?,price_paid=?,updated_at=? WHERE instance_id=?",(acc["account_id"],t,price,t,sale["instance_id"]))
+                    conn.execute("UPDATE market_listings SET status='sold',buyer_id=?,updated_at=?,completed_at=? WHERE listing_id=?",(acc["account_id"],t,t,lid))
+                    meta=json.dumps({"listing_id":lid,"instance_id":sale["instance_id"],"card_id":sale["card_id"]},separators=(",",":"))
+                    conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",(secrets.token_hex(16),acc["account_id"],"market_buy",-price,t,meta))
+                    conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",(secrets.token_hex(16),seller,"market_sale",price,t,meta))
+                    conn.commit(); state=economy_state(conn,acc["account_id"],False)
+                finally: conn.close()
+                self._json(200,{"ok":True,"listing_id":lid,"instance_id":sale["instance_id"],"price_yt":price,"state":state}); return
+            if self.path in ("/api/economy/train", "/api/economy/perfect", "/api/economy/change-art"):
+                acc = auth_account(self.headers)
+                if not acc:
+                    self._json(401, {"ok": False, "error": "Session invalide."}); return
+                b = self._body(); iid = str(b.get("instance_id") or "").strip()
+                if not iid:
+                    self._json(400, {"ok": False, "error": "Exemplaire manquant."}); return
+                conn = db()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    inst = conn.execute("SELECT * FROM card_instances WHERE instance_id=? AND owner_id=?", (iid, acc["account_id"])).fetchone()
+                    if not inst:
+                        conn.rollback(); self._json(404, {"ok": False, "error": "Exemplaire introuvable."}); return
+                    if int(inst["listed"]):
+                        conn.rollback(); self._json(409, {"ok": False, "error": "Impossible : cet exemplaire est en vente."}); return
+                    balance_row = conn.execute("SELECT yt_balance FROM accounts WHERE account_id=?", (acc["account_id"],)).fetchone()
+                    balance = int(balance_row["yt_balance"] if balance_row else 0)
+                    t = now()
+
+                    if self.path == "/api/economy/train":
+                        cost = 100
+                        old_p = int(inst["current_potential"])
+                        if old_p >= 100:
+                            conn.rollback(); self._json(409, {"ok": False, "error": "Potentiel déjà à 100 %."}); return
+                        if balance < cost:
+                            conn.rollback(); self._json(409, {"ok": False, "error": "YT insuffisants.", "yt_balance": balance}); return
+                        success = secrets.randbelow(100) < 62
+                        new_p = old_p + 1 if success else old_p
+                        conn.execute("UPDATE accounts SET yt_balance=yt_balance-?,updated_at=? WHERE account_id=?", (cost, t, acc["account_id"]))
+                        if success:
+                            conn.execute("UPDATE card_instances SET current_potential=?,updated_at=? WHERE instance_id=?", (new_p, t, iid))
+                        meta = {"instance_id": iid, "card_id": inst["card_id"], "old_potential": old_p, "new_potential": new_p, "outcome": "SUCCESS" if success else "FAIL"}
+                        conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                                     (secrets.token_hex(16), acc["account_id"], "training", -cost, t, json.dumps(meta, separators=(",", ":"))))
+                        conn.commit()
+                        state = economy_state(conn, acc["account_id"], True)
+                        self._json(200, {"ok": True, "kind": "training", "instance_id": iid, "cost_yt": cost,
+                                         "outcome": meta["outcome"], "success": success, "old_potential": old_p, "new_potential": new_p, "state": state}); return
+
+                    stat_map = {"hp": "overjet_hp", "tai": "overjet_tai", "nin": "overjet_nin", "gen": "overjet_gen"}
+                    bonuses = {k: int(inst[v]) for k, v in stat_map.items()}
+                    total_bonus = sum(bonuses.values())
+                    if int(inst["current_potential"]) < 100:
+                        conn.rollback(); self._json(409, {"ok": False, "error": "Potentiel 100 % requis."}); return
+
+                    if self.path == "/api/economy/perfect":
+                        cost = 200
+                        stat = str(b.get("stat") or "").strip().lower()
+                        if stat not in stat_map:
+                            conn.rollback(); self._json(400, {"ok": False, "error": "Statistique invalide."}); return
+                        if total_bonus >= 10:
+                            conn.rollback(); self._json(409, {"ok": False, "error": "Perfection maximale : +10 % total. Utilise le Changement d'art."}); return
+                        if balance < cost:
+                            conn.rollback(); self._json(409, {"ok": False, "error": "YT insuffisants.", "yt_balance": balance}); return
+                        old_bonus = bonuses[stat]
+                        roll = secrets.randbelow(100)
+                        if old_bonus <= 0:
+                            outcome = "SUCCESS" if roll < 62 else "FAIL"
+                        else:
+                            outcome = "CRITICAL_FAIL" if roll < 28 else ("FAIL" if roll < 56 else "SUCCESS")
+                        new_bonus = old_bonus
+                        if outcome == "SUCCESS":
+                            new_bonus = old_bonus + 1
+                        elif outcome == "CRITICAL_FAIL":
+                            new_bonus = max(0, old_bonus - 1)
+                        conn.execute("UPDATE accounts SET yt_balance=yt_balance-?,updated_at=? WHERE account_id=?", (cost, t, acc["account_id"]))
+                        conn.execute(f"UPDATE card_instances SET {stat_map[stat]}=?,updated_at=? WHERE instance_id=?", (new_bonus, t, iid))
+                        meta = {"instance_id": iid, "card_id": inst["card_id"], "stat": stat, "old_bonus": old_bonus, "new_bonus": new_bonus, "outcome": outcome}
+                        conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                                     (secrets.token_hex(16), acc["account_id"], "perfection", -cost, t, json.dumps(meta, separators=(",", ":"))))
+                        conn.commit()
+                        state = economy_state(conn, acc["account_id"], True)
+                        self._json(200, {"ok": True, "kind": "perfection", "instance_id": iid, "cost_yt": cost, "stat": stat,
+                                         "outcome": outcome, "old_bonus": old_bonus, "new_bonus": new_bonus, "state": state}); return
+
+                    # Changement d'art : disponible à +10 total. Le hasard et le débit restent serveur.
+                    cost = 200
+                    source = str(b.get("source_stat") or "").strip().lower()
+                    target = str(b.get("target_stat") or "").strip().lower()
+                    if source not in stat_map or target not in stat_map or source == target:
+                        conn.rollback(); self._json(400, {"ok": False, "error": "Statistiques source/cible invalides."}); return
+                    if total_bonus < 10:
+                        conn.rollback(); self._json(409, {"ok": False, "error": "Changement d'art disponible à +10 % total."}); return
+                    if bonuses[source] <= 0:
+                        conn.rollback(); self._json(409, {"ok": False, "error": "La statistique source n'a aucun point à transférer."}); return
+                    if balance < cost:
+                        conn.rollback(); self._json(409, {"ok": False, "error": "YT insuffisants.", "yt_balance": balance}); return
+                    source_old = bonuses[source]; target_old = bonuses[target]
+                    roll = secrets.randbelow(100)
+                    outcome = "CRITICAL_FAIL" if roll < 28 else ("FAIL" if roll < 56 else "SUCCESS")
+                    source_new = source_old; target_new = target_old
+                    if outcome == "SUCCESS":
+                        source_new -= 1; target_new += 1
+                    elif outcome == "CRITICAL_FAIL":
+                        source_new -= 1
+                    conn.execute("UPDATE accounts SET yt_balance=yt_balance-?,updated_at=? WHERE account_id=?", (cost, t, acc["account_id"]))
+                    conn.execute(f"UPDATE card_instances SET {stat_map[source]}=?,{stat_map[target]}=?,updated_at=? WHERE instance_id=?",
+                                 (source_new, target_new, t, iid))
+                    meta = {"instance_id": iid, "card_id": inst["card_id"], "source_stat": source, "target_stat": target,
+                            "source_old": source_old, "source_new": source_new, "target_old": target_old, "target_new": target_new, "outcome": outcome}
+                    conn.execute("INSERT INTO economy_ledger(entry_id,account_id,kind,amount,created_at,metadata_json) VALUES(?,?,?,?,?,?)",
+                                 (secrets.token_hex(16), acc["account_id"], "change_art", -cost, t, json.dumps(meta, separators=(",", ":"))))
+                    conn.commit()
+                    state = economy_state(conn, acc["account_id"], True)
+                    self._json(200, {"ok": True, "kind": "change_art", "instance_id": iid, "cost_yt": cost, "outcome": outcome,
+                                     "source_stat": source, "target_stat": target, "source_old": source_old, "source_new": source_new,
+                                     "target_old": target_old, "target_new": target_new, "state": state}); return
+                except Exception:
+                    try: conn.rollback()
+                    except Exception: pass
+                    raise
+                finally:
+                    conn.close()
             if self.path == "/api/economy/solo/start":
                 acc = auth_account(self.headers)
                 if not acc:
@@ -707,9 +977,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/health":
                 try:
                     hc = db(); hc.execute("SELECT 1").fetchone(); hc.close()
-                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.0.11","economy":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
+                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.2.0-progression-market","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
                 except Exception as exc:
-                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.0.11","economy":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
+                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.2.0-progression-market","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
                 return
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
@@ -746,6 +1016,47 @@ class Handler(BaseHTTPRequestHandler):
                 if not state:
                     self._json(404, {"ok": False, "error": "Compte introuvable."}); return
                 self._json(200, state); return
+            if u.path in ("/api/market/listings", "/api/market/mine", "/api/market/history"):
+                acc=auth_account(self.headers)
+                if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
+                conn=db()
+                try:
+                    limit=max(1,min(100,int((q.get("limit") or ["60"])[0])))
+                    if u.path == "/api/market/mine":
+                        listings=market_listings(conn,"l.seller_id=? AND l.status='active'",(acc["account_id"],),"l.created_at DESC",limit)
+                    elif u.path == "/api/market/history":
+                        listings=market_listings(conn,"(l.seller_id=? OR l.buyer_id=?) AND l.status<>'active'",(acc["account_id"],acc["account_id"]),"l.updated_at DESC",limit)
+                    else:
+                        clauses=["l.status='active'"]; params=[]
+                        cid=str((q.get("card_id") or [""])[0]).strip()
+                        if cid: clauses.append("l.card_id=?"); params.append(cid)
+                        search=str((q.get("search") or [""])[0]).strip().casefold()
+                        if search:
+                            matching_ids = [
+                                card["id"] for card in ECONOMY_CATALOG
+                                if search in str(card["id"]).casefold() or search in str(card["name"]).casefold()
+                            ]
+                            if matching_ids:
+                                clauses.append("l.card_id IN (" + ",".join("?" for _ in matching_ids) + ")")
+                                params.extend(matching_ids)
+                            else:
+                                clauses.append("1=0")
+                        minp=max(0,int((q.get("min_price") or ["0"])[0])); maxp=max(0,int((q.get("max_price") or ["0"])[0])); minpot=max(0,min(100,int((q.get("min_potential") or ["0"])[0])))
+                        minpercent_raw=int((q.get("min_percent") or ["0"])[0])
+                        minpercent=0 if minpercent_raw <= 0 else max(90,min(110,minpercent_raw))
+                        full_only=str((q.get("full_only") or ["0"])[0]).strip().casefold() in ("1","true","yes","oui")
+                        total_percent_sql="(i.current_potential+i.overjet_hp+i.overjet_tai+i.overjet_nin+i.overjet_gen)"
+                        if minp: clauses.append("l.price_yt>=?"); params.append(minp)
+                        if maxp: clauses.append("l.price_yt<=?"); params.append(maxp)
+                        if minpot: clauses.append("i.current_potential>=?"); params.append(minpot)
+                        if minpercent: clauses.append(total_percent_sql+">=?"); params.append(minpercent)
+                        if full_only:
+                            clauses.append("i.current_potential>=100")
+                            clauses.append("(i.overjet_hp+i.overjet_tai+i.overjet_nin+i.overjet_gen)>=10")
+                        sort=str((q.get("sort") or ["price_asc"])[0]); orders={"price_asc":"l.price_yt ASC,l.created_at DESC","price_desc":"l.price_yt DESC,l.created_at DESC","newest":"l.created_at DESC","potential":total_percent_sql+" DESC,l.price_yt ASC"}
+                        listings=market_listings(conn," AND ".join(clauses),tuple(params),orders.get(sort,orders["price_asc"]),limit)
+                finally: conn.close()
+                self._json(200,{"ok":True,"listings":listings,"count":len(listings),"max_active_per_seller":MARKET_MAX_ACTIVE_LISTINGS,"min_price":MARKET_MIN_PRICE,"max_price":MARKET_MAX_PRICE}); return
             if u.path == "/api/account/me":
                 acc=auth_account(self.headers)
                 if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
@@ -772,7 +1083,7 @@ def main():
         raise SystemExit(2)
 
     db().close()
-    print(f"YUGITO Auth 2.0.11 sur 0.0.0.0:{PORT} -> {PUBLIC_BASE} | DB={DB_BACKEND} | persistent={bool(DATABASE_URL)}")
+    print(f"YUGITO Auth 2.2.0 PROGRESSION+MARKET sur 0.0.0.0:{PORT} -> {PUBLIC_BASE} | DB={DB_BACKEND} | persistent={bool(DATABASE_URL)}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 if __name__ == "__main__":
