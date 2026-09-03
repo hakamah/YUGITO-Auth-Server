@@ -1,8 +1,8 @@
-# YUGITO Auth Server - 2.3.1 PRODUCTION • GOOGLE NATIVE ANDROID + CREDENTIAL MANAGER READY + PROFIL + INSTANCES + ENTRAÎNEMENT + HDV
+# YUGITO Auth Server - 2.2.0 PRODUCTION • INSTANCES + ENTRAÎNEMENT + PERFECTION + HDV
 # Start Command Render : python yugito_auth_server.py
 # Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, DATABASE_URL (sur Render)
 # YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
-# requirements.txt : paho-mqtt>=2.1,<3 ; psycopg[binary]>=3.2,<4 ; google-auth>=2.40,<3 ; requests>=2.32,<3
+# requirements.txt : paho-mqtt>=2.1,<3 ; psycopg[binary]>=3.2,<4
 #
 from __future__ import annotations
 
@@ -18,15 +18,6 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-
-# Validation cryptographique des ID tokens du flux natif Android.
-try:
-    from google.oauth2 import id_token as google_id_token
-    from google.auth.transport.requests import Request as GoogleAuthRequest
-except Exception:
-    google_id_token = None
-    GoogleAuthRequest = None
-
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -294,28 +285,12 @@ def _ensure_schema(conn: DBConnection):
           updated_at INTEGER NOT NULL,
           completed_at INTEGER
         );
-        CREATE TABLE IF NOT EXISTS profile_match_stats(
-          account_id TEXT PRIMARY KEY,
-          classic_wins INTEGER NOT NULL DEFAULT 0,
-          classic_losses INTEGER NOT NULL DEFAULT 0,
-          ranked_wins INTEGER NOT NULL DEFAULT 0,
-          ranked_losses INTEGER NOT NULL DEFAULT 0,
-          updated_at INTEGER NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS profile_match_events(
-          event_id TEXT PRIMARY KEY,
-          account_id TEXT NOT NULL,
-          mode TEXT NOT NULL,
-          victory INTEGER NOT NULL,
-          created_at INTEGER NOT NULL
-        );
         CREATE INDEX IF NOT EXISTS idx_owned_cards_account ON owned_cards(account_id);
         CREATE INDEX IF NOT EXISTS idx_solo_permits_account ON solo_permits(account_id);
         CREATE INDEX IF NOT EXISTS idx_ledger_account ON economy_ledger(account_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_instances_owner ON card_instances(owner_id, card_id);
         CREATE INDEX IF NOT EXISTS idx_market_active ON market_listings(status, price_yt, created_at);
         CREATE INDEX IF NOT EXISTS idx_market_seller ON market_listings(seller_id, status, created_at);
-        CREATE INDEX IF NOT EXISTS idx_profile_events_account ON profile_match_events(account_id, created_at);
         """)
         if conn.backend == "postgres":
             conn.execute("ALTER TABLE accounts ADD COLUMN IF NOT EXISTS elo INTEGER NOT NULL DEFAULT 100")
@@ -339,135 +314,8 @@ def _ensure_schema(conn: DBConnection):
                          SELECT ?,?,?,?,?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM card_instances WHERE instance_id=?)""",
                          (iid, legacy["account_id"], legacy["card_id"], potential, potential, "LEGACY_MIGRATION",
                           int(legacy["purchased_at"]), int(legacy["price_yt"]), 0, now(), iid))
-        _migrate_legacy_multiplayer_profile(conn)
         conn.commit()
         _SCHEMA_READY = True
-
-
-def _table_exists(conn: DBConnection, table_name: str) -> bool:
-    name = str(table_name or "").strip()
-    if not name:
-        return False
-    if conn.backend == "postgres":
-        row = conn.execute(
-            "SELECT 1 AS ok FROM information_schema.tables WHERE table_schema='public' AND table_name=? LIMIT 1",
-            (name,),
-        ).fetchone()
-        return bool(row)
-    row = conn.execute(
-        "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
-        (name,),
-    ).fetchone()
-    return bool(row)
-
-
-def _profile_stats_row(conn: DBConnection, account_id: str):
-    t = now()
-    conn.execute(
-        """INSERT INTO profile_match_stats(account_id,classic_wins,classic_losses,ranked_wins,ranked_losses,updated_at)
-           VALUES(?,0,0,0,0,?) ON CONFLICT(account_id) DO NOTHING""",
-        (account_id, t),
-    )
-    return conn.execute("SELECT * FROM profile_match_stats WHERE account_id=?", (account_id,)).fetchone()
-
-
-def _migrate_legacy_multiplayer_profile(conn: DBConnection):
-    """Best-effort import des anciens résultats si la table yugito_matches existe déjà."""
-    if not _table_exists(conn, "yugito_matches"):
-        return
-    try:
-        rows = conn.execute(
-            "SELECT mode,winner_id,loser_id FROM yugito_matches WHERE mode IN ('classic','ranked')"
-        ).fetchall()
-    except Exception:
-        return
-    counts = {}
-    for row in rows:
-        mode = str(row["mode"] if "mode" in row.keys() else "").lower()
-        winner = str(row["winner_id"] if "winner_id" in row.keys() else "")
-        loser = str(row["loser_id"] if "loser_id" in row.keys() else "")
-        if mode not in ("classic", "ranked") or not winner or not loser:
-            continue
-        for aid in (winner, loser):
-            counts.setdefault(aid, {"classic_wins":0,"classic_losses":0,"ranked_wins":0,"ranked_losses":0})
-        counts[winner][mode + "_wins"] += 1
-        counts[loser][mode + "_losses"] += 1
-    t = now()
-    for aid, c in counts.items():
-        conn.execute(
-            """INSERT INTO profile_match_stats(account_id,classic_wins,classic_losses,ranked_wins,ranked_losses,updated_at)
-               VALUES(?,?,?,?,?,?)
-               ON CONFLICT(account_id) DO UPDATE SET
-                 classic_wins=CASE WHEN profile_match_stats.classic_wins<excluded.classic_wins THEN excluded.classic_wins ELSE profile_match_stats.classic_wins END,
-                 classic_losses=CASE WHEN profile_match_stats.classic_losses<excluded.classic_losses THEN excluded.classic_losses ELSE profile_match_stats.classic_losses END,
-                 ranked_wins=CASE WHEN profile_match_stats.ranked_wins<excluded.ranked_wins THEN excluded.ranked_wins ELSE profile_match_stats.ranked_wins END,
-                 ranked_losses=CASE WHEN profile_match_stats.ranked_losses<excluded.ranked_losses THEN excluded.ranked_losses ELSE profile_match_stats.ranked_losses END,
-                 updated_at=excluded.updated_at""",
-            (aid,c["classic_wins"],c["classic_losses"],c["ranked_wins"],c["ranked_losses"],t),
-        )
-
-
-def profile_stats_payload(conn: DBConnection, account_id: str):
-    acc = conn.execute("SELECT * FROM accounts WHERE account_id=?", (account_id,)).fetchone()
-    if not acc:
-        return {}
-    card_row = conn.execute(
-        """SELECT COUNT(*) AS cards_owned,
-                  COALESCE(SUM(CASE WHEN current_potential>=100 AND
-                    (overjet_hp+overjet_tai+overjet_nin+overjet_gen)>=10 THEN 1 ELSE 0 END),0) AS full_110_cards
-           FROM card_instances WHERE owner_id=?""",
-        (account_id,),
-    ).fetchone()
-    solo_row = conn.execute(
-        """SELECT COUNT(*) AS solo_games,
-                  COALESCE(SUM(CASE WHEN victory=1 THEN 1 ELSE 0 END),0) AS solo_wins,
-                  COALESCE(SUM(CASE WHEN victory=0 THEN 1 ELSE 0 END),0) AS solo_losses
-           FROM solo_permits WHERE account_id=? AND settled_at IS NOT NULL""",
-        (account_id,),
-    ).fetchone()
-    match_row = _profile_stats_row(conn, account_id)
-    cw = int(match_row["classic_wins"] if match_row else 0)
-    cl = int(match_row["classic_losses"] if match_row else 0)
-    rw = int(match_row["ranked_wins"] if match_row else 0)
-    rl = int(match_row["ranked_losses"] if match_row else 0)
-    return {
-        "cards_owned": int(card_row["cards_owned"] if card_row else 0),
-        "full_110_cards": int(card_row["full_110_cards"] if card_row else 0),
-        "solo_games": int(solo_row["solo_games"] if solo_row else 0),
-        "solo_wins": int(solo_row["solo_wins"] if solo_row else 0),
-        "solo_losses": int(solo_row["solo_losses"] if solo_row else 0),
-        "classic_wins": cw,
-        "classic_losses": cl,
-        "classic_games": cw + cl,
-        "classic_winrate": round((100.0 * cw / (cw + cl)), 1) if (cw + cl) else 0.0,
-        "ranked_wins": rw,
-        "ranked_losses": rl,
-        "ranked_games": rw + rl,
-        "ranked_winrate": round((100.0 * rw / (rw + rl)), 1) if (rw + rl) else 0.0,
-        "elo": int(acc["elo"] if "elo" in acc.keys() else 100),
-        "yt_balance": int(acc["yt_balance"] if "yt_balance" in acc.keys() else 0),
-    }
-
-
-def record_profile_multiplayer(conn: DBConnection, account_id: str, mode: str, victory: bool, match_id: str):
-    mode = str(mode or "").strip().lower()
-    if mode not in ("classic", "ranked"):
-        raise ValueError("Mode profil invalide.")
-    event_id = str(match_id or "").strip()
-    if len(event_id) < 8 or len(event_id) > 160:
-        raise ValueError("Identifiant de match invalide.")
-    prior = conn.execute("SELECT event_id FROM profile_match_events WHERE event_id=?", (event_id,)).fetchone()
-    if prior:
-        return profile_stats_payload(conn, account_id), True
-    row = _profile_stats_row(conn, account_id)
-    field = mode + ("_wins" if victory else "_losses")
-    # field vient exclusivement de la whitelist mode/victory ci-dessus.
-    conn.execute(f"UPDATE profile_match_stats SET {field}={field}+1,updated_at=? WHERE account_id=?", (now(), account_id))
-    conn.execute(
-        "INSERT INTO profile_match_events(event_id,account_id,mode,victory,created_at) VALUES(?,?,?,?,?)",
-        (event_id, account_id, mode, 1 if victory else 0, now()),
-    )
-    return profile_stats_payload(conn, account_id), False
 
 
 def db():
@@ -490,8 +338,6 @@ def _adopt_account_id(conn: DBConnection, current_id: str, desired_id: str):
     conn.execute("UPDATE market_listings SET seller_id=? WHERE seller_id=?", (desired_id, current_id))
     conn.execute("UPDATE market_listings SET buyer_id=? WHERE buyer_id=?", (desired_id, current_id))
     conn.execute("UPDATE solo_permits SET account_id=? WHERE account_id=?", (desired_id, current_id))
-    conn.execute("UPDATE profile_match_stats SET account_id=? WHERE account_id=?", (desired_id, current_id))
-    conn.execute("UPDATE profile_match_events SET account_id=? WHERE account_id=?", (desired_id, current_id))
     conn.execute("UPDATE economy_ledger SET account_id=? WHERE account_id=?", (desired_id, current_id))
     return desired_id
 
@@ -617,7 +463,6 @@ def economy_state(conn, account_id: str, include_catalog: bool = True):
             "ends_at": rotation["ends_at"],
             "card_ids": free_ids,
         },
-        "profile_stats": profile_stats_payload(conn, account_id),
     }
     if include_catalog:
         data["catalog"] = ECONOMY_CATALOG
@@ -694,89 +539,6 @@ def google_exchange(code: str):
         raise RuntimeError("Adresse Google non vérifiée.")
     return claims
 
-
-
-def google_verify_native_id_token(token: str, expected_nonce: str):
-    """Vérifie l'ID token produit par Credential Manager / Sign in with Google."""
-    token = str(token or "").strip()
-    expected_nonce = str(expected_nonce or "").strip()
-    if not token:
-        raise RuntimeError("Jeton Google manquant.")
-    if not GOOGLE_CLIENT_ID:
-        raise RuntimeError("GOOGLE_CLIENT_ID absent du serveur.")
-
-    if google_id_token is not None and GoogleAuthRequest is not None:
-        try:
-            claims = google_id_token.verify_oauth2_token(token, GoogleAuthRequest(), GOOGLE_CLIENT_ID)
-        except Exception as exc:
-            raise RuntimeError("Jeton Google invalide.") from exc
-    else:
-        # Compatibilité locale seulement. Render installe google-auth via requirements.txt.
-        try:
-            with urllib.request.urlopen(
-                "https://oauth2.googleapis.com/tokeninfo?id_token=" + urllib.parse.quote(token), timeout=15
-            ) as r:
-                claims = json.loads(r.read().decode())
-        except Exception as exc:
-            raise RuntimeError("Impossible de valider le jeton Google.") from exc
-
-    if str(claims.get("aud") or "") != GOOGLE_CLIENT_ID:
-        raise RuntimeError("Audience Google invalide.")
-    if str(claims.get("iss") or "") not in ("accounts.google.com", "https://accounts.google.com"):
-        raise RuntimeError("Émetteur Google invalide.")
-    if int(claims.get("exp") or 0) <= now():
-        raise RuntimeError("Token Google expiré.")
-    if not str(claims.get("sub") or "").strip():
-        raise RuntimeError("Identité Google incomplète.")
-    if expected_nonce and str(claims.get("nonce") or "") != expected_nonce:
-        raise RuntimeError("Nonce Google invalide.")
-    return claims
-
-
-def complete_device_google_login(conn, device_code: str, claims: dict):
-    """Mappe Google -> compte YUGITO puis finalise le device flow existant."""
-    dev = conn.execute(
-        "SELECT * FROM devices WHERE device_code=? AND expires_at>?", (device_code, now())
-    ).fetchone()
-    if not dev:
-        raise RuntimeError("Connexion Google expirée.")
-
-    if dev["account_id"] and dev["session_token"]:
-        row = conn.execute("SELECT * FROM accounts WHERE account_id=?", (dev["account_id"],)).fetchone()
-        if not row:
-            raise RuntimeError("Compte YUGITO introuvable.")
-        return row, str(dev["session_token"]), False
-
-    sub = str(claims.get("sub") or "").strip()
-    row = conn.execute("SELECT * FROM accounts WHERE google_sub=?", (sub,)).fetchone()
-    created = False
-    if not row:
-        aid = secrets.token_hex(16)
-        t = now()
-        conn.execute(
-            "INSERT INTO accounts(account_id,google_sub,email,display_name,picture,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (aid, sub, str(claims.get("email") or ""), str(claims.get("name") or ""),
-             str(claims.get("picture") or ""), t, t),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM accounts WHERE account_id=?", (aid,)).fetchone()
-        created = True
-    else:
-        conn.execute(
-            "UPDATE accounts SET email=?,display_name=?,picture=?,updated_at=? WHERE account_id=?",
-            (str(claims.get("email") or ""), str(claims.get("name") or ""),
-             str(claims.get("picture") or ""), now(), row["account_id"]),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM accounts WHERE account_id=?", (row["account_id"],)).fetchone()
-
-    session = new_session(conn, row["account_id"])
-    conn.execute(
-        "UPDATE devices SET account_id=?,session_token=? WHERE device_code=?",
-        (row["account_id"], session, device_code),
-    )
-    conn.commit()
-    return row, session, created
 
 def verify_legacy_mqtt(pseudo: str, account_id: str, token: str, timeout=5.0) -> bool:
     """Vérifie l'ancien compte YUGITO retained MQTT avant migration Google."""
@@ -856,30 +618,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/device/start":
                 b = self._body(); code = secrets.token_urlsafe(32)
                 conn = db(); conn.execute("INSERT INTO devices(device_code,platform,created_at,expires_at) VALUES(?,?,?,?)", (code, str(b.get("platform") or "unknown")[:20], now(), now()+DEVICE_TTL)); conn.commit(); conn.close()
-                self._json(200, {"ok": True, "device_code": code, "verification_url": PUBLIC_BASE + "/login?device_code=" + urllib.parse.quote(code), "google_client_id": GOOGLE_CLIENT_ID, "native_google": True, "expires_in": DEVICE_TTL, "interval": 2}); return
-            if self.path == "/api/device/google-token":
-                b = self._body()
-                dc = str(b.get("device_code") or "").strip()
-                token = str(b.get("id_token") or "").strip()
-                if not dc or not token:
-                    self._json(400, {"ok": False, "error": "device_code ou id_token manquant."}); return
-                conn = db()
-                try:
-                    dev = conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?", (dc, now())).fetchone()
-                    if not dev:
-                        self._json(410, {"ok": False, "status": "expired", "error": "Connexion Google expirée."}); return
-                    auth_mode = str(b.get("auth_mode") or "credential_manager").strip().lower()
-                    # Credential Manager binds its token to the device_code via nonce.
-                    # The Android framework AccountManager compatibility path returns
-                    # a Google-signed audience token without a nonce, so we validate
-                    # issuer/audience/expiry but rely on the one-time short-lived
-                    # device_code to bind the exchange to this login attempt.
-                    expected_nonce = "" if auth_mode == "account_manager" else dc
-                    claims = google_verify_native_id_token(token, expected_nonce)
-                    row, _session, created = complete_device_google_login(conn, dc, claims)
-                    self._json(200, {"ok": True, "status": "authenticated", "created": bool(created), "account": account_public(row)}); return
-                finally:
-                    conn.close()
+                self._json(200, {"ok": True, "device_code": code, "verification_url": PUBLIC_BASE + "/login?device_code=" + urllib.parse.quote(code), "expires_in": DEVICE_TTL, "interval": 2}); return
             if self.path == "/api/account/claim-pseudo":
                 # Flux officiel : Google d'abord, puis choix du pseudo.
                 # Si le pseudo appartient à l'ancienne identité locale du PC,
@@ -971,24 +710,6 @@ class Handler(BaseHTTPRequestHandler):
                 row = conn.execute("SELECT * FROM accounts WHERE account_id=?", (acc["account_id"],)).fetchone()
                 conn.close()
                 self._json(200, {"ok": True, "account": account_public(row)}); return
-            if self.path == "/api/profile/multiplayer/record":
-                acc = auth_account(self.headers)
-                if not acc:
-                    self._json(401, {"ok": False, "error": "Session invalide."}); return
-                b = self._body()
-                mode = str(b.get("mode") or "").strip().lower()
-                victory = bool(b.get("victory", False))
-                match_id = str(b.get("match_id") or "").strip()
-                conn = db()
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    stats, duplicate = record_profile_multiplayer(conn, acc["account_id"], mode, victory, match_id)
-                    conn.commit()
-                except ValueError as exc:
-                    conn.rollback(); self._json(400,{"ok":False,"error":str(exc)}); return
-                finally:
-                    conn.close()
-                self._json(200,{"ok":True,"duplicate":duplicate,"profile_stats":stats}); return
             if self.path == "/api/economy/purchase":
                 acc = auth_account(self.headers)
                 if not acc:
@@ -1256,9 +977,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/health":
                 try:
                     hc = db(); hc.execute("SELECT 1").fetchone(); hc.close()
-                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.3.1-google-native","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
+                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.2.1-native-google-return","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
                 except Exception as exc:
-                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.3.1-google-native","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
+                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.2.1-native-google-return","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
                 return
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
@@ -1270,9 +991,14 @@ class Handler(BaseHTTPRequestHandler):
                 code=(q.get("code") or [""])[0]; state=(q.get("state") or [""])[0]
                 conn=db(); dev=conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?",(state,now())).fetchone()
                 if not dev: conn.close(); self._html(400,"<h1>Connexion expirée</h1>"); return
-                claims=google_exchange(code)
-                row, session, _created = complete_device_google_login(conn, state, claims)
-                platform = str(dev["platform"] or "").strip().lower(); conn.close()
+                claims=google_exchange(code); sub=str(claims.get("sub") or "")
+                row=conn.execute("SELECT * FROM accounts WHERE google_sub=?",(sub,)).fetchone()
+                if not row:
+                    aid=secrets.token_hex(16); t=now()
+                    conn.execute("INSERT INTO accounts(account_id,google_sub,email,display_name,picture,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(aid,sub,claims.get("email",""),claims.get("name",""),claims.get("picture",""),t,t)); conn.commit(); row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(aid,)).fetchone()
+                else:
+                    conn.execute("UPDATE accounts SET email=?,display_name=?,picture=?,updated_at=? WHERE account_id=?",(claims.get("email",""),claims.get("name",""),claims.get("picture",""),now(),row["account_id"])); conn.commit(); row=conn.execute("SELECT * FROM accounts WHERE account_id=?",(row["account_id"],)).fetchone()
+                session=new_session(conn,row["account_id"]); conn.execute("UPDATE devices SET account_id=?,session_token=? WHERE device_code=?",(row["account_id"],session,state)); conn.commit(); platform = str(dev["platform"] or "").strip().lower(); conn.close()
                 if platform == "android":
                     # L'APK Android ouvre Google dans un Partial Custom Tab. Ce lien explicite
                     # ramène directement au GodotActivity après validation. Si le navigateur
@@ -1343,16 +1069,6 @@ class Handler(BaseHTTPRequestHandler):
                         listings=market_listings(conn," AND ".join(clauses),tuple(params),orders.get(sort,orders["price_asc"]),limit)
                 finally: conn.close()
                 self._json(200,{"ok":True,"listings":listings,"count":len(listings),"max_active_per_seller":MARKET_MAX_ACTIVE_LISTINGS,"min_price":MARKET_MIN_PRICE,"max_price":MARKET_MAX_PRICE}); return
-            if u.path == "/api/profile/stats":
-                acc=auth_account(self.headers)
-                if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
-                conn=db()
-                try:
-                    stats=profile_stats_payload(conn,acc["account_id"])
-                    conn.commit()
-                finally:
-                    conn.close()
-                self._json(200,{"ok":True,"profile_stats":stats}); return
             if u.path == "/api/account/me":
                 acc=auth_account(self.headers)
                 if not acc: self._json(401,{"ok":False,"error":"Session invalide."}); return
@@ -1379,7 +1095,7 @@ def main():
         raise SystemExit(2)
 
     db().close()
-    print(f"YUGITO Auth 2.3.1 GOOGLE-NATIVE+PROFILE+PROGRESSION+MARKET sur 0.0.0.0:{PORT} -> {PUBLIC_BASE} | DB={DB_BACKEND} | persistent={bool(DATABASE_URL)}")
+    print(f"YUGITO Auth 2.2.0 PROGRESSION+MARKET sur 0.0.0.0:{PORT} -> {PUBLIC_BASE} | DB={DB_BACKEND} | persistent={bool(DATABASE_URL)}")
     ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-# YUGITO Auth Server 2.2.0 — production CardInstance / progression / HDV
+# YUGITO Auth Server 2.2.1 — production CardInstance / progression / HDV
 
 Cette version part du serveur 2.1.0 Hôtel des ventes et rend la progression autoritaire côté serveur.
 
