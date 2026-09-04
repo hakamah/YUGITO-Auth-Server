@@ -1,4 +1,4 @@
-# YUGITO Auth Server - 2.3.1 PRODUCTION • GOOGLE NATIVE ANDROID + CREDENTIAL MANAGER READY + PROFIL + INSTANCES + ENTRAÎNEMENT + HDV
+# YUGITO Auth Server - 2.3.2 PRODUCTION • GOOGLE WEB BOOTSTRAP + NATIVE READY + PROFIL + INSTANCES + ENTRAÎNEMENT + HDV
 # Start Command Render : python yugito_auth_server.py
 # Variables requises : GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, DATABASE_URL (sur Render)
 # YUGITO_PUBLIC_BASE_URL est facultative sur Render si RENDER_EXTERNAL_URL est disponible.
@@ -1256,10 +1256,34 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/health":
                 try:
                     hc = db(); hc.execute("SELECT 1").fetchone(); hc.close()
-                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.3.1-google-native","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
+                    self._json(200,{"ok":True,"service":"YUGITO Auth","version":"persistent-2.3.2-google-web-bootstrap","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"time":now()})
                 except Exception as exc:
-                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.3.1-google-native","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
+                    self._json(503,{"ok":False,"service":"YUGITO Auth","version":"persistent-2.3.2-google-web-bootstrap","economy":True,"market":True,"database_backend":DB_BACKEND,"persistent":bool(DATABASE_URL),"database_error":str(exc),"time":now()})
                 return
+            if u.path == "/login/start":
+                # V12 Android bootstrap: the APK generates a one-time device_code locally and
+                # opens this URL immediately in a Custom Tab. The browser request itself creates
+                # the pending device row, so the app never has to block on /api/device/start
+                # before showing Google. This keeps the existing /api/device/start flow intact
+                # for older clients / PC.
+                dc = str((q.get("device_code") or [""])[0]).strip()
+                platform = str((q.get("platform") or ["android"])[0]).strip().lower()[:20] or "android"
+                if len(dc) < 32 or len(dc) > 128 or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for ch in dc):
+                    self._html(400,"<h1>Connexion invalide</h1><p>Relance la connexion depuis YUGITO.</p>"); return
+                conn = db()
+                try:
+                    existing = conn.execute("SELECT device_code FROM devices WHERE device_code=?", (dc,)).fetchone()
+                    if existing:
+                        conn.execute("UPDATE devices SET platform=?,created_at=?,expires_at=?,account_id=NULL,session_token=NULL,consumed=0 WHERE device_code=?", (platform, now(), now()+DEVICE_TTL, dc))
+                    else:
+                        conn.execute("INSERT INTO devices(device_code,platform,created_at,expires_at) VALUES(?,?,?,?)", (dc, platform, now(), now()+DEVICE_TTL))
+                    conn.commit()
+                finally:
+                    conn.close()
+                self.send_response(302)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Location", PUBLIC_BASE + "/login?device_code=" + urllib.parse.quote(dc))
+                self.end_headers(); return
             if u.path == "/login":
                 dc=(q.get("device_code") or [""])[0]
                 conn=db(); row=conn.execute("SELECT * FROM devices WHERE device_code=? AND expires_at>?",(dc,now())).fetchone(); conn.close()
