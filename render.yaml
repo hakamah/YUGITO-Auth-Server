@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python yugito_win_chain_server.py
+    startCommand: python yugito_auth_server.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.7
