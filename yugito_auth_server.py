@@ -78,6 +78,19 @@ def _probe_device_start(self):
 # mechanism that is live today and made Credential Manager reliable.
 _stable_handler_class.do_POST = _probe_device_start
 
+# WIN_CHAIN_V1 was originally written against a server revision that exposed
+# this cleanup helper.  The known-good stable Google core does not.  Provide a
+# tiny compatibility implementation instead of modifying the stable core.
+def _clean_old_solo_permits_compat(conn):
+    conn.execute(
+        "DELETE FROM solo_permits WHERE settled_at IS NULL AND expires_at<=?",
+        (core.now(),),
+    )
+
+
+if not hasattr(core, "_clean_old_solo_permits"):
+    core._clean_old_solo_permits = _clean_old_solo_permits_compat
+
 # The historical WIN_CHAIN_V1 module imports `yugito_auth_server as base`.
 # When this file is executed as a script its module name is __main__, so bind
 # that import explicitly to the stable core instead of recursively importing
@@ -99,6 +112,11 @@ class Handler(win_chain.Handler):
     WIN_CHAIN_V1 is entered only by a client that explicitly sends
     `X-Yugito-Win-Chain: 1`.  Google/Auth routes are never intercepted here.
     """
+
+    def _json(self, code, payload):
+        if int(code) >= 500 and self.path in _WIN_CHAIN_ROUTES:
+            print("[WIN_CHAIN_ERROR] path=%s payload=%r" % (self.path, payload), flush=True)
+        return super()._json(code, payload)
 
     def do_POST(self):
         if self.path in _WIN_CHAIN_ROUTES:
