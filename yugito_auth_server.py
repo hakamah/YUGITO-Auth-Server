@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import secrets
 import sys
+import threading
 import urllib.parse
 
 import yugito_auth_server_core as core
 from yugito_auth_server_core import *
 
 # Keep an immutable reference to the exact stable production handler and its
-# original do_POST implementation.  WIN_CHAIN must never replace Google/Auth.
+# original do_POST implementation. WIN_CHAIN must never replace Google/Auth.
 _stable_handler_class = core.Handler
 _original_do_post = core.Handler.do_POST
 
@@ -74,12 +75,12 @@ def _probe_device_start(self):
                 print("[DEVICE_START_PROBE] DB_CLOSE_ERROR " + repr(exc), flush=True)
 
 
-# Patch only the stable base handler's device/start method.  This is the exact
+# Patch only the stable base handler's device/start method. This is the exact
 # mechanism that is live today and made Credential Manager reliable.
 _stable_handler_class.do_POST = _probe_device_start
 
 # WIN_CHAIN_V1 was originally written against a server revision that exposed
-# this cleanup helper.  The known-good stable Google core does not.  Provide a
+# this cleanup helper. The known-good stable Google core does not. Provide a
 # tiny compatibility implementation instead of modifying the stable core.
 def _clean_old_solo_permits_compat(conn):
     conn.execute(
@@ -98,13 +99,17 @@ if not hasattr(core, "_clean_old_solo_permits"):
 sys.modules["yugito_auth_server"] = core
 import yugito_win_chain_server as win_chain
 
-# Current mobile 2.1.5 allows Solo decks independently of the account's
-# permanent collection.  The historical WIN_CHAIN validator assumed every
-# card used in battle had to exist in owned_cards, which rejects legitimate
-# current APK decks (fresh accounts can have 0 permanent cards).  Keep the
-# important server-side checks — 8 unique known cards, star cap and per-rarity
-# limits — but do not require permanent ownership for reward calculation.
-def _deck_context_mobile_compat(conn, account_id, raw_deck):
+# Preserve the historical strict validator for multiplayer anti-cheat.
+_strict_multiplayer_deck_context = win_chain._deck_context
+_request_policy = threading.local()
+
+
+def _solo_deck_context(conn, account_id, raw_deck):
+    """Solo: all catalogue cards are usable at base 100%.
+
+    We still validate the deck server-side (8 unique known cards, <=32.5★ and
+    rarity limits), but permanent collection ownership must not block Solo.
+    """
     if raw_deck is None:
         return 32.5, []
     if not isinstance(raw_deck, list):
@@ -132,7 +137,16 @@ def _deck_context_mobile_compat(conn, account_id, raw_deck):
     return round(total, 1), ids
 
 
-win_chain._deck_context = _deck_context_mobile_compat
+def _route_aware_deck_context(conn, account_id, raw_deck):
+    # Thread-local because Render's ThreadingHTTPServer can process several
+    # matches simultaneously. Solo ignores permanent ownership; multiplayer
+    # keeps the original strict ownership validation as anti-cheat.
+    if bool(getattr(_request_policy, "solo_mode", False)):
+        return _solo_deck_context(conn, account_id, raw_deck)
+    return _strict_multiplayer_deck_context(conn, account_id, raw_deck)
+
+
+win_chain._deck_context = _route_aware_deck_context
 
 _WIN_CHAIN_ROUTES = {
     "/api/economy/solo/start",
@@ -146,7 +160,7 @@ class Handler(win_chain.Handler):
     """Compatibility gate: old APKs remain on the stable economy behaviour.
 
     WIN_CHAIN_V1 is entered only by a client that explicitly sends
-    `X-Yugito-Win-Chain: 1`.  Google/Auth routes are never intercepted here.
+    `X-Yugito-Win-Chain: 1`. Google/Auth routes are never intercepted here.
     """
 
     def _json(self, code, payload):
@@ -160,7 +174,17 @@ class Handler(win_chain.Handler):
             if not enabled:
                 return _stable_handler_class.do_POST(self)
             print("[WIN_CHAIN_SAFE] " + self.path, flush=True)
-        return super().do_POST()
+
+        # Solo can use any catalogue card at 100%; multiplayer uses strict
+        # account ownership validation. The flag is scoped to this request.
+        _request_policy.solo_mode = self.path in (
+            "/api/economy/solo/start",
+            "/api/economy/solo/settle",
+        )
+        try:
+            return super().do_POST()
+        finally:
+            _request_policy.solo_mode = False
 
 
 core.Handler = Handler
