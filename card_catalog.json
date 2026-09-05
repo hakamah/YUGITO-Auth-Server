@@ -400,5 +400,11 @@
     "name": "Anko Mitarashi",
     "stars": 3.5,
     "price_yt": 500
+  },
+  {
+    "id": "ibiki_morino",
+    "name": "Ibiki Morino",
+    "stars": 4.0,
+    "price_yt": 1000
   }
 ]
