@@ -98,6 +98,42 @@ if not hasattr(core, "_clean_old_solo_permits"):
 sys.modules["yugito_auth_server"] = core
 import yugito_win_chain_server as win_chain
 
+# Current mobile 2.1.5 allows Solo decks independently of the account's
+# permanent collection.  The historical WIN_CHAIN validator assumed every
+# card used in battle had to exist in owned_cards, which rejects legitimate
+# current APK decks (fresh accounts can have 0 permanent cards).  Keep the
+# important server-side checks — 8 unique known cards, star cap and per-rarity
+# limits — but do not require permanent ownership for reward calculation.
+def _deck_context_mobile_compat(conn, account_id, raw_deck):
+    if raw_deck is None:
+        return 32.5, []
+    if not isinstance(raw_deck, list):
+        raise ValueError("Deck invalide.")
+    ids = [str(x or "").strip() for x in raw_deck]
+    if len(ids) != 8:
+        raise ValueError("Le deck doit contenir exactement 8 cartes.")
+    if any(not x for x in ids) or len(set(ids)) != 8:
+        raise ValueError("Deck invalide ou carte en double.")
+
+    cards = []
+    for cid in ids:
+        card = core.CATALOG_BY_ID.get(cid)
+        if not card:
+            raise ValueError("Carte inconnue dans le deck.")
+        cards.append(card)
+
+    total = sum(float(c["stars"]) for c in cards)
+    if total > 32.5001:
+        raise ValueError("Le deck dépasse 32,5★.")
+    limits = {3.5: 4, 4.0: 3, 4.5: 2, 5.0: 1}
+    for stars, limit in limits.items():
+        if sum(1 for c in cards if abs(float(c["stars"]) - stars) < 0.01) > limit:
+            raise ValueError("Le deck ne respecte pas les limites d'étoiles.")
+    return round(total, 1), ids
+
+
+win_chain._deck_context = _deck_context_mobile_compat
+
 _WIN_CHAIN_ROUTES = {
     "/api/economy/solo/start",
     "/api/economy/solo/settle",
@@ -114,25 +150,19 @@ class Handler(win_chain.Handler):
     """
 
     def _json(self, code, payload):
-        if int(code) >= 500 and self.path in _WIN_CHAIN_ROUTES:
-            print("[WIN_CHAIN_ERROR] path=%s payload=%r" % (self.path, payload), flush=True)
+        if int(code) >= 400 and self.path in _WIN_CHAIN_ROUTES:
+            print("[WIN_CHAIN_ERROR] path=%s code=%s payload=%r" % (self.path, code, payload), flush=True)
         return super()._json(code, payload)
 
     def do_POST(self):
         if self.path in _WIN_CHAIN_ROUTES:
             enabled = str(self.headers.get(_WIN_CHAIN_HEADER, "")).strip() == "1"
             if not enabled:
-                # Directly use the stable handler.  Its /api/device/start probe
-                # remains installed, although device/start is not one of these
-                # economy routes.
                 return _stable_handler_class.do_POST(self)
             print("[WIN_CHAIN_SAFE] " + self.path, flush=True)
         return super().do_POST()
 
 
-# core.main() resolves its module-global Handler at runtime.  Point only that
-# symbol to the gated composite handler; the superclass used by WIN_CHAIN is
-# still the original stable handler object captured above.
 core.Handler = Handler
 
 
